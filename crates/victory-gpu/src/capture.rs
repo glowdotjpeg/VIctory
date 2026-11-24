@@ -65,6 +65,20 @@ pub(crate) fn wanted(n: u64) -> bool {
     folder().is_some() && (n.is_power_of_two() || listed(n))
 }
 
+pub(crate) fn trace_transfer(
+    operation: &str,
+    src: crate::object::This,
+    dst: crate::object::This,
+) {
+    let frame = crate::queue::presented() + 1;
+    if listed(frame) {
+        tracing::debug!(
+            target: "victory_gpu::capture::passes",
+            frame, operation, ?src, ?dst, "captured texture transfer"
+        );
+    }
+}
+
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);

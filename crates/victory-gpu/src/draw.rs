@@ -628,6 +628,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.trace_pass(list, "dispatch", true, false);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -638,14 +639,20 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            {
+                self.trace_pass(list, "dispatch", true, false);
+                crate::pipeline::note_drop(self.pipeline as This);
+            }
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let ran = self.bind(list, p, true);
+        #[cfg(feature = "diagnostics")]
+        self.trace_pass(list, "dispatch", true, ran);
+        if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -710,6 +717,8 @@ impl State {
                 }
                 Err(_) => false,
             };
+        #[cfg(feature = "diagnostics")]
+        self.trace_pass(list, "mesh", false, ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -940,6 +949,43 @@ impl State {
         out
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn trace_pass(&self, list: &HostList, operation: &str, compute: bool, recorded: bool) {
+        if !tracing::enabled!(target: "victory_gpu::capture::passes", tracing::Level::DEBUG) {
+            return;
+        }
+        let frame = crate::queue::presented() + 1;
+        if !crate::capture::listed(frame) {
+            return;
+        }
+        let targets: Vec<_> = if compute {
+            Vec::new()
+        } else {
+            self.targets
+                .iter()
+                .map(|&(resource, _)| resource as This)
+                .collect()
+        };
+        let depth = if compute {
+            None
+        } else {
+            self.depth.map(|(r, _)| r as This)
+        };
+        tracing::debug!(
+            target: "victory_gpu::capture::passes",
+            frame,
+            list = ?list.list.as_raw(),
+            operation,
+            recorded,
+            pipeline = ?(self.pipeline as This),
+            topology = self.topology,
+            ?targets,
+            ?depth,
+            views = ?recorded.then(|| self.reads(compute)),
+            "captured pass"
+        );
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -952,6 +998,8 @@ impl State {
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        #[cfg(feature = "diagnostics")]
+        self.trace_pass(list, "draw", false, ran);
         if ran {
             // Rectangles were expanded into their own vertex buffers (their
             // count checked to fit by `rectangles`).
@@ -1056,6 +1104,8 @@ impl State {
             once!("indexed rectangles not drawn");
         }
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        #[cfg(feature = "diagnostics")]
+        self.trace_pass(list, "indexed draw", false, ran);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1144,11 +1194,27 @@ impl State {
             },
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        self.trace_pass(
+            list,
+            match kind {
+                DRAW => "indirect draw",
+                INDEXED => "indirect indexed draw",
+                MESH => "indirect mesh",
+                DISPATCH => "indirect dispatch",
+                _ => "indirect",
+            },
+            kind == DISPATCH,
+            ran,
+        );
         if !ran {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {}, topology {})",
+                    p.compute, p.mesh, self.topology
+                )),
             }
             return false;
         }
@@ -1268,7 +1334,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{r:?} {}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {

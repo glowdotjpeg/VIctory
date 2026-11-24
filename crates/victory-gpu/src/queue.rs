@@ -395,7 +395,12 @@ fn show(resource: Option<object::Held>) {
         && let Some(host) = crate::host::host()
     {
         #[cfg(feature = "diagnostics")]
-        let state = texture.state(0);
+        let state = {
+            if crate::capture::listed(frame) {
+                tracing::info!(frame, ?resource, "captured present source");
+            }
+            texture.state(0)
+        };
         let shown = host.present(&texture, frame);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
