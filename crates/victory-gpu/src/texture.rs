@@ -7,7 +7,7 @@
 //!
 //! "Changed" means a page of the memory was written since the last detiling
 //! ([`crate::watch`]), in write-watched memory; in physical-page views,
-//! which cannot be watched, a content hash of the whole memory at every
+//! which cannot be watched, a content hash of the resident memory at every
 //! submission that samples it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
@@ -22,6 +22,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
+
+// Refreshes run during serialized submission. Reuse one read buffer across textures.
+static READ_BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -48,13 +51,17 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<ContentHash>,
     asked: u64,
-    read: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentHash {
+    Full(blake3::Hash),
+    Partial(blake3::Hash),
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -189,23 +196,34 @@ impl Staging {
         }
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        let watched = if let Some((now, written)) =
+            crate::watch::writes(start, start.saturating_add(size), false)
+        {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
             last.asked = now;
+            last.hash = None;
+            true
+        } else {
+            last.asked = 0;
+            false
+        };
+        let mut read = READ_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+        if read.len() < size {
+            read.resize(size, 0);
+        }
+        let read = &mut read[..size];
+        if watched {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            self.detile(read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        last.read.resize(size, 0);
-        match read_resident(self.memory, &mut last.read) {
+        match read_resident(self.memory, read) {
             Residency::Unmapped => {
                 last.hash = None;
                 #[cfg(feature = "diagnostics")]
@@ -218,30 +236,35 @@ impl Staging {
                 0
             }
             Residency::Full => {
-                let hash = blake3::hash(&last.read);
+                let hash = ContentHash::Full(blake3::hash(read));
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
                     return size;
                 }
                 last.hash = Some(hash);
-                self.detile(&last.read);
+                self.detile(read);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
             }
             Residency::Partial(intervals) => {
-                let (hash, resident_bytes) = hash_intervals(&last.read, &intervals);
+                let (hash, resident_bytes) = hash_intervals(read, &intervals);
+                let hash = ContentHash::Partial(hash);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, resident_bytes as u64);
                 if last.hash == Some(hash) {
                     return resident_bytes;
                 }
-                zero_gaps(&mut last.read, &intervals);
+                zero_gaps(read, &intervals);
                 last.hash = Some(hash);
-                self.detile(&last.read);
+                self.detile(read);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexChanged, resident_bytes as u64);
+                {
+                    use crate::copystat::{self, C};
+                    copystat::add(C::TexChanged, resident_bytes as u64);
+                    copystat::add(C::TexPartialUploads, 1);
+                }
                 resident_bytes
             }
         }
@@ -701,7 +724,7 @@ mod tests {
         // SAFETY: `back.list` is open and both resources are live.
         unsafe { back.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         back.close();
-        host.execute(&[&back]);
+        host.execute(&[&back], "streamed texture readback test");
 
         let mut mapped = std::ptr::null_mut();
         let range = D3D12_RANGE {
@@ -792,7 +815,7 @@ mod tests {
         let list = host.new_list().unwrap();
         upload(&list, resource_guard.0, host_tex);
         list.close();
-        host.execute(&[&list]);
+        host.execute(&[&list], "streamed texture first upload test");
 
         assert_eq!(
             readback_mip(host, resource_guard.0, host_tex, 2, 64, 64),
@@ -820,7 +843,7 @@ mod tests {
         list.reset();
         upload(&list, resource_guard.0, host_tex);
         list.close();
-        host.execute(&[&list]);
+        host.execute(&[&list], "streamed texture mip upload test");
 
         assert_eq!(
             readback_mip(host, resource_guard.0, host_tex, 1, 128, 128),
@@ -836,7 +859,7 @@ mod tests {
         list.reset();
         upload(&list, resource_guard.0, host_tex);
         list.close();
-        host.execute(&[&list]);
+        host.execute(&[&list], "streamed texture eviction test");
 
         assert!(
             readback_mip(host, resource_guard.0, host_tex, 1, 128, 128)
