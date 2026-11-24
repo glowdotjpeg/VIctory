@@ -951,6 +951,14 @@ impl Host {
     }
 
     fn execute_locked(&self, runs: &[&HostList], submitted: &mut u64, operation: &str) {
+        // SAFETY: a status query on our device.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            self.submission_failed(
+                operation,
+                runs,
+                format_args!("device removed before preparation, last fence {submitted}"),
+            );
+        }
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -1005,6 +1013,14 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
+            // SAFETY: a status query on our device.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                self.submission_failed(
+                    operation,
+                    runs,
+                    format_args!("device removed before execution, last fence {submitted}"),
+                );
+            }
             *submitted += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
