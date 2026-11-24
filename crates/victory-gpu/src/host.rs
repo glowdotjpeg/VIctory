@@ -2562,7 +2562,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written_over(dst, dst.saturating_add(len));
                     woken.add(crate::fence::write_and_collect(dst, len, || {
                         copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     }));
@@ -2588,7 +2588,7 @@ impl HostList {
                 }
                 Step::Run(_, _, work) | Step::Host(work) => {
                     if let Step::Run(dst, len, _) = step {
-                        batch.title_written();
+                        batch.title_written_over(*dst, (*dst).saturating_add(*len));
                         woken.add(crate::fence::write_and_collect(*dst, *len, work));
                     } else {
                         work();
@@ -2601,8 +2601,10 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
+                    // The shaders start from the title's data: this
+                    // buffer's refreshes the range's pages overlap are
+                    // done before the snapshot takes them.
+                    batch.gpu_write(shadow, *address, *len);
                     shadow.writing(*address, *len);
                     continue;
                 }
@@ -2620,8 +2622,8 @@ impl HostList {
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// range that covers them: done before a step whose title write their
+/// pages overlap, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -2632,6 +2634,16 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+}
+
+/// Whether a refresh's hull `[a, b)` and a title write `[from, to)`
+/// share a 64 KiB page: a refresh's write-watch query rounds to whole
+/// pages (`crate::watch::writes`), so its reset takes a page's kernel
+/// bits together even when the ranges themselves are disjoint bytes, and
+/// a write into a page the query touches must see it done first.
+fn shares_page(a: usize, b: usize, from: usize, to: usize) -> bool {
+    const PAGE: usize = crate::watch::PAGE;
+    a < b && from < to && a / PAGE <= (to - 1) / PAGE && from / PAGE <= (b - 1) / PAGE
 }
 
 impl Batch {
@@ -2653,23 +2665,80 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// Before a step that may write title memory anywhere (a submission
+    /// split, or the end of the batch, which must leave nothing pending):
+    /// every refresh is done first, and textures are checked again after.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
     }
 
-    fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    /// Before a step that writes title memory `[from, to)`: refreshes
+    /// sharing a page with the write are done first (their query must
+    /// take the bytes before the write does), and textures are checked
+    /// again after it. Refreshes of other pages stay pending: the write
+    /// cannot change the bytes they copy, and keeping them merges their
+    /// queries — a `GetWriteWatch` call costs tens of microseconds mostly
+    /// regardless of its span (more the bigger the watched pool), so one
+    /// query of a buffer's hull per submission beats several of its
+    /// pieces.
+    fn title_written_over(&mut self, from: usize, to: usize) {
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let (_, a, b) = &self.refreshes[i];
+            if shares_page(*a, *b, from, to) {
+                let (shadow, a, b) = self.refreshes.remove(i);
+                self.update(shadow, a, b);
+            } else {
+                i += 1;
+            }
         }
+        self.textures.clear();
+    }
+
+    /// Before a step that gives shaders `[address, address + len)` of a
+    /// buffer copy: that buffer's refreshes sharing a page with the range
+    /// are done first, so the snapshot `Shadow::writing` takes (the
+    /// shaders start from the title's data) has the refreshed bytes.
+    /// Refreshes of other buffers read title memory, which the shaders'
+    /// writes reach only at copy-back — after the lists ran, with this
+    /// batch's end flush before that — so they stay pending; so do the
+    /// other pages of this buffer.
+    fn gpu_write(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        let to = address.saturating_add(len.max(1));
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let (s, a, b) = &self.refreshes[i];
+            if std::sync::Arc::ptr_eq(s, shadow) && shares_page(*a, *b, address, to) {
+                let (shadow, a, b) = self.refreshes.remove(i);
+                self.update(shadow, a, b);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Runs every pending refresh, in recorded order.
+    fn flush(&mut self) {
+        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
+            self.update(shadow, from, to);
+        }
+    }
+
+    /// Runs one pending refresh: `[from, to)` of `shadow`'s copy, timed.
+    fn update(&mut self, shadow: std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 }
 
@@ -3487,8 +3556,26 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, shares_page};
     use std::sync::Arc;
+
+    #[test]
+    fn flush_overlap_is_page_rounded() {
+        const PAGE: usize = crate::watch::PAGE;
+        // Overlapping ranges share a page.
+        assert!(shares_page(0, PAGE, 8, 16));
+        // Disjoint bytes on one page: a refresh's query takes the page's
+        // kernel bits together, so the write must see it done first.
+        assert!(shares_page(8, 24, 40, 56));
+        // Neighbouring pages do not: the hull's query stops at its last
+        // page's end.
+        assert!(!shares_page(0, PAGE, PAGE, PAGE + 16));
+        assert!(!shares_page(PAGE, PAGE + 16, 0, PAGE));
+        // Far apart.
+        assert!(!shares_page(0, PAGE, 12 * PAGE, 12 * PAGE + 16));
+        assert!(!shares_page(8, 24, 40, 40));
+        assert!(shares_page(usize::MAX - 16, usize::MAX, usize::MAX - 8, usize::MAX));
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
@@ -3555,6 +3642,376 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
              before {n_before} hashes in {before:?}, after {n_after} in {after:?} ({:.1}x)",
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
+        );
+    }
+}
+
+/// The batch's flush around real write-watched title memory: which steps
+/// query a hull and in what order, and that the copy ends up with the
+/// title's bytes whatever the interleaving. A device is needed for the
+/// copies; without one, `VICTORY_D3D12_WARP=1`.
+#[cfg(all(test, feature = "diagnostics"))]
+mod refresh_flush {
+    use super::{Batch, host};
+    use crate::watch::PAGE;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    // 0x20_0000, `MEM_WRITE_WATCH` (in SystemServices in windows-sys).
+    const WATCH: u32 = 0x20_0000;
+
+    /// A fresh write-watched allocation, freed when dropped.
+    struct Watched {
+        at: usize,
+        len: usize,
+    }
+    impl Watched {
+        fn new(pages: usize) -> Self {
+            // SAFETY: committed here, freed in `Drop`.
+            let at = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    pages * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(at, 0);
+            Watched { at, len: pages * PAGE }
+        }
+    }
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(self.at as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    static RESOURCE: AtomicUsize = AtomicUsize::new(7001);
+
+    /// A shadow over a fresh watched allocation, registered so that
+    /// `find` makes its copy exactly the allocation's size.
+    fn make_shadow(w: &Watched) -> Arc<crate::shadow::Shadow> {
+        let resource = RESOURCE.fetch_add(1, Relaxed);
+        crate::shadow::register(resource, w.at as u64, w.len as u64);
+        let shadow = crate::shadow::find(w.at as u64, w.len as u64)
+            .expect("a device for the shadow (set VICTORY_D3D12_WARP=1)");
+        // A first query of everything: fresh allocations can inherit a
+        // freed one's journal entries; from here the pages this test
+        // dirties are the only stale ones.
+        crate::watch::writes(w.at, w.at + w.len, false).expect("write-watched");
+        shadow
+    }
+
+    /// The shadow's copy mapped for the test to inspect, and to stand in
+    /// for the GPU's writes to it (the shadow keeps its own mapping).
+    struct Mapped<'a> {
+        buffer: &'a ID3D12Resource,
+        data: *mut u8,
+    }
+    impl<'a> Mapped<'a> {
+        fn new(shadow: &'a crate::shadow::Shadow) -> Self {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a CPU-visible buffer, mapped again.
+            unsafe { shadow.buffer.Map(0, None, Some(&mut data)) }.expect("map the copy");
+            Mapped { buffer: &shadow.buffer, data: data.cast() }
+        }
+        fn byte(&self, at: usize) -> u8 {
+            // SAFETY: inside the mapping, which spans the shadow.
+            unsafe { *self.data.add(at) }
+        }
+        fn write(&self, at: usize, value: u8) {
+            // SAFETY: inside the mapping.
+            unsafe { *self.data.add(at) = value };
+        }
+    }
+    impl Drop for Mapped<'_> {
+        fn drop(&mut self) {
+            // SAFETY: our mapping.
+            unsafe { self.buffer.Unmap(0, None) };
+        }
+    }
+
+    /// Whether the title's write to `at` is still unreported by any query
+    /// (its kernel bit is alive): only a query that finds it written
+    /// journals it with that asking's number.
+    fn bit_alive(at: usize) -> bool {
+        let (now, pages) = crate::watch::writes(at, at + PAGE, false).expect("write-watched");
+        pages.iter().any(|&(p, w)| p == at / PAGE && w == now)
+    }
+
+    /// Writes the watched allocation the way the title's threads do (a
+    /// plain write, which leaves a kernel bit).
+    fn title_write(at: usize, value: u8) {
+        // SAFETY: committed pages of ours.
+        unsafe { (at as *mut u8).write(value) };
+    }
+
+    /// Reads the watched allocation back (what the title's threads read).
+    fn title_read(at: usize) -> u8 {
+        // SAFETY: committed pages of ours.
+        unsafe { (at as *const u8).read() }
+    }
+
+    #[test]
+    fn disjoint_title_copies_keep_the_hulls_query_pending() {
+        if host().is_none() {
+            return;
+        }
+        let w = Watched::new(16);
+        let at = w.at;
+        let shadow = make_shadow(&w);
+        let mapped = Mapped::new(&shadow);
+        let mut batch = Batch::default();
+        // The first list's draws read the hull's four pages; the title
+        // wrote each of them.
+        for page in 0..4usize {
+            title_write(at + page * PAGE + 8, 0x40 + page as u8);
+        }
+        batch.add(&shadow, at, 4 * PAGE);
+        // A copy step writing title memory on another page cannot change
+        // the bytes the hull copies: the hull stays pending, nothing
+        // queries it (a full flush here would walk the hull for nothing).
+        batch.title_written_over(at + 12 * PAGE, at + 12 * PAGE + 16);
+        assert_eq!(batch.refreshes.len(), 1);
+        assert!(bit_alive(at + PAGE + 8), "the disjoint copy left the hull unqueried");
+        // A second list reads the same hull; again a disjoint copy.
+        for page in 0..4usize {
+            title_write(at + page * PAGE + 40, 0x50 + page as u8);
+        }
+        batch.add(&shadow, at, 4 * PAGE);
+        assert_eq!(batch.refreshes.len(), 1, "one list's hulls merge");
+        batch.title_written_over(at + 13 * PAGE, at + 13 * PAGE + 16);
+        assert!(bit_alive(at + 2 * PAGE + 8), "still nothing queried the hull");
+        // The end of the batch flushes everything before the lists run:
+        // one query of the hull covers both lists' writes.
+        batch.title_written();
+        assert!(batch.refreshes.is_empty());
+        for page in 0..4usize {
+            assert_eq!(mapped.byte(page * PAGE + 8), 0x40 + page as u8);
+            assert_eq!(mapped.byte(page * PAGE + 40), 0x50 + page as u8);
+        }
+    }
+
+    #[test]
+    fn a_write_sharing_the_hulls_page_flushes_it_before_itself() {
+        if host().is_none() {
+            return;
+        }
+        let w = Watched::new(4);
+        let at = w.at;
+        let shadow = make_shadow(&w);
+        let mapped = Mapped::new(&shadow);
+        let mut batch = Batch::default();
+        // The title wrote bytes the hull covers ...
+        title_write(at + 8, 0xAA);
+        title_write(at + 23, 0xAA);
+        batch.add(&shadow, at + 8, 16);
+        // ... and its copy step writes other bytes of the same 64 KiB
+        // page. The pages meet, so the flush comes first.
+        batch.title_written_over(at + 40, at + 56);
+        assert_eq!(mapped.byte(8), 0xAA, "refreshed before the write");
+        assert_eq!(mapped.byte(23), 0xAA);
+        // The write lands after the flush's query: its bit is alive (a
+        // query after the write would have taken it).
+        title_write(at + 40, 0xBB);
+        title_write(at + 55, 0xBB);
+        assert!(bit_alive(at + 40), "the write came after the flush's query");
+        // A later refresh of the whole page takes the write: the page's
+        // rounded reset cost the refresh nothing.
+        batch.add(&shadow, at, PAGE);
+        batch.title_written();
+        assert_eq!(mapped.byte(40), 0xBB, "the CPU write is not lost");
+        assert_eq!(mapped.byte(55), 0xBB);
+        assert_eq!(mapped.byte(8), 0xAA, "and the copied bytes stand");
+        assert_eq!(mapped.byte(23), 0xAA);
+    }
+
+    #[test]
+    fn a_gpu_write_flushes_only_its_own_shadows_overlapping_refresh() {
+        if host().is_none() {
+            return;
+        }
+        // Two buffers; each has a pending refresh at submission time.
+        let a = Watched::new(4);
+        let b = Watched::new(4);
+        let s1 = make_shadow(&a);
+        let s2 = make_shadow(&b);
+        let m1 = Mapped::new(&s1);
+        let m2 = Mapped::new(&s2);
+        let mut batch = Batch::default();
+        title_write(a.at + 8, 0x60);
+        title_write(b.at + 8, 0x70);
+        batch.add(&s1, a.at, PAGE);
+        batch.add(&s2, b.at, PAGE);
+        let texture = Arc::new(0u32);
+        assert!(batch.texture_due(&texture), "sampled this submission");
+        // A step whose shaders write page 0 of the first buffer: its
+        // refresh is done first (the snapshot takes the refreshed bytes).
+        batch.gpu_write(&s1, a.at, PAGE);
+        assert_eq!(m1.byte(8), 0x60, "refreshed before the snapshot");
+        assert_eq!(batch.refreshes.len(), 1, "the other buffer's stays pending");
+        assert!(std::sync::Arc::ptr_eq(&batch.refreshes[0].0, &s2));
+        assert!(bit_alive(b.at + 8), "no query of the other buffer");
+        // Shaders do not write textures: no invalidation (as before).
+        assert!(!batch.texture_due(&texture));
+        // The end of the batch flushes the rest before the lists run.
+        batch.title_written();
+        assert_eq!(m2.byte(8), 0x70);
+        assert!(batch.refreshes.is_empty());
+        assert!(batch.texture_due(&texture), "a title write makes them due");
+        // The shaders write a byte of the copy after the snapshot; copy
+        // back puts just it into title memory (the bytes the snapshot saw
+        // refreshed stay alone).
+        s1.writing(a.at, PAGE);
+        m1.write(16, 0x61);
+        let mut woken = crate::fence::Woken::default();
+        assert_eq!(s1.copy_back(a.at, PAGE, &mut woken), PAGE);
+        woken.run();
+        assert_eq!(title_read(a.at + 16), 0x61, "the GPU's byte went back");
+        assert_eq!(title_read(a.at + 8), 0x60, "nothing else was written");
+        // A later refresh takes the copy-back's bytes and any the title's
+        // threads wrote meanwhile.
+        title_write(a.at + 24, 0x63);
+        batch.add(&s1, a.at, PAGE);
+        batch.title_written();
+        assert_eq!(m1.byte(16), 0x61, "the copy keeps what it wrote back");
+        assert_eq!(m1.byte(24), 0x63, "and takes the title's new bytes");
+    }
+
+    /// The flush of a submission's refreshes: one full flush per title
+    /// copy (a hull re-walked per copy, the old behaviour) against
+    /// flushing only what the copy's pages overlap, with the same bytes
+    /// copied in the end. Run with
+    /// `cargo test --release -p victory-gpu --features diagnostics
+    /// -- --ignored --nocapture flush_per_title_copy`.
+    #[test]
+    #[ignore = "benchmark; set VICTORY_D3D12_WARP=1"]
+    fn flush_per_title_copy_against_overlap_only() {
+        if host().is_none() {
+            return;
+        }
+        const BUFFERS: usize = 8;
+        const PAGES: usize = 128; // 8 MiB each
+        const LISTS: usize = 28;
+        const COPIES: usize = 5;
+        let buffers: Vec<Watched> = (0..BUFFERS).map(|_| Watched::new(PAGES)).collect();
+        let shadows: Vec<_> = buffers.iter().map(make_shadow).collect();
+        let maps: Vec<_> = shadows.iter().map(|s| Mapped::new(s)).collect();
+        // The copies go to their own memory, as the title's copies between
+        // buffers do.
+        let scratch = Watched::new(4);
+        let run = |overlap_only: bool, mark: u8| {
+            let mut batch = Batch::default();
+            let started = std::time::Instant::now();
+            for list in 0..LISTS {
+                for (b, shadow) in shadows.iter().enumerate() {
+                    // Each list reads a different stretch of each buffer.
+                    let from = (list * 3 + b * 5) % (PAGES - 16);
+                    title_write(buffers[b].at + from * PAGE, mark + b as u8);
+                    batch.add(shadow, buffers[b].at + from * PAGE, 16 * PAGE);
+                }
+                for copy in 0..COPIES {
+                    let dst = scratch.at + ((list * COPIES + copy) % 4) * PAGE;
+                    title_write(dst, mark);
+                    if overlap_only {
+                        batch.title_written_over(dst, dst + PAGE);
+                    } else {
+                        batch.title_written();
+                    }
+                }
+            }
+            batch.title_written();
+            started.elapsed()
+        };
+        let _ = run(false, 1); // warm up
+        let whole = run(false, 2);
+        // Both patterns copied the same bytes: every hull is up to date.
+        for (b, map) in maps.iter().enumerate() {
+            for list in 0..LISTS {
+                let from = (list * 3 + b * 5) % (PAGES - 16);
+                assert_eq!(map.byte(from * PAGE), 2 + b as u8);
+            }
+        }
+        let over = run(true, 3);
+        for (b, map) in maps.iter().enumerate() {
+            for list in 0..LISTS {
+                let from = (list * 3 + b * 5) % (PAGES - 16);
+                assert_eq!(map.byte(from * PAGE), 3 + b as u8, "the last run's bytes");
+            }
+        }
+        println!(
+            "{LISTS} lists, {BUFFERS} buffers of {} MiB, {COPIES} title copies per list: \
+             full flush per copy {whole:?}, overlap only {over:?} ({:.1}x)",
+            PAGES as f64 * PAGE as f64 / 1048576.0,
+            whole.as_secs_f64() / over.as_secs_f64(),
+        );
+    }
+
+    /// The same A/B at the world's sizes: buffers a world heap's ~64 MiB
+    /// (the run logs' top hull is 182 MB), a hull per buffer spanning it,
+    /// read by every list. The fixed cost of a `GetWriteWatch` call grows
+    /// with the watched pool (the title keeps 9-13 GiB), so the ratio
+    /// below understates production.
+    #[test]
+    #[ignore = "benchmark; set VICTORY_D3D12_WARP=1"]
+    fn flush_per_title_copy_world_sized() {
+        if host().is_none() {
+            return;
+        }
+        const BUFFERS: usize = 4;
+        const PAGES: usize = 1024; // 64 MiB each
+        const LISTS: usize = 28;
+        const COPIES: usize = 3;
+        let buffers: Vec<Watched> = (0..BUFFERS).map(|_| Watched::new(PAGES)).collect();
+        let shadows: Vec<_> = buffers.iter().map(make_shadow).collect();
+        let maps: Vec<_> = shadows.iter().map(|s| Mapped::new(s)).collect();
+        let scratch = Watched::new(4);
+        let run = |overlap_only: bool, mark: u8| {
+            let mut batch = Batch::default();
+            let started = std::time::Instant::now();
+            for list in 0..LISTS {
+                for (b, shadow) in shadows.iter().enumerate() {
+                    let from = (list * 37 + b * 11) % (PAGES - 16);
+                    title_write(buffers[b].at + from * PAGE, mark + b as u8);
+                    batch.add(shadow, buffers[b].at, PAGES * PAGE);
+                }
+                for copy in 0..COPIES {
+                    let dst = scratch.at + ((list * COPIES + copy) % 4) * PAGE;
+                    title_write(dst, mark);
+                    if overlap_only {
+                        batch.title_written_over(dst, dst + PAGE);
+                    } else {
+                        batch.title_written();
+                    }
+                }
+            }
+            batch.title_written();
+            started.elapsed()
+        };
+        let _ = run(false, 1); // warm up
+        let whole = run(false, 2);
+        for (b, map) in maps.iter().enumerate() {
+            for list in 0..LISTS {
+                let from = (list * 37 + b * 11) % (PAGES - 16);
+                assert_eq!(map.byte(from * PAGE), 2 + b as u8);
+            }
+        }
+        let over = run(true, 3);
+        for (b, map) in maps.iter().enumerate() {
+            for list in 0..LISTS {
+                let from = (list * 37 + b * 11) % (PAGES - 16);
+                assert_eq!(map.byte(from * PAGE), 3 + b as u8, "the last run's bytes");
+            }
+        }
+        println!(
+            "{LISTS} lists, {BUFFERS} buffers of {} MiB, {COPIES} title copies per list: \
+             full flush per copy {whole:?}, overlap only {over:?} ({:.1}x)",
+            PAGES as f64 * PAGE as f64 / 1048576.0,
+            whole.as_secs_f64() / over.as_secs_f64(),
         );
     }
 }
