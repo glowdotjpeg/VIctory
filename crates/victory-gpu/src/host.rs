@@ -1537,10 +1537,10 @@ impl Host {
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![lists]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [lists];
         #[cfg(not(feature = "diagnostics"))]
         let _ = firsts;
         for (i, group) in groups.iter().enumerate() {
