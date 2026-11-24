@@ -227,6 +227,12 @@ struct Pending {
 
 static MEMORY: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_memory_waits() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_TRACE_MEMORY_WAITS").is_some())
+}
+
 impl MemoryWait {
     pub(crate) fn new(predicate: Predicate) -> Self {
         Self {
@@ -245,7 +251,16 @@ impl MemoryWait {
         on_fresh_match: impl FnOnce(Predicate),
     ) -> bool {
         if let Some(observed) = &self.observed {
-            return observed.load(Ordering::Acquire);
+            let reached = observed.load(Ordering::Acquire);
+            #[cfg(feature = "diagnostics")]
+            if reached && trace_memory_waits() {
+                tracing::info!(
+                    timeline = ?Arc::as_ptr(queue),
+                    wait = ?self.predicate,
+                    "title queue resumed after its memory wait"
+                );
+            }
+            return reached;
         }
         let fences = live();
         let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -269,6 +284,14 @@ impl MemoryWait {
         });
         drop(pending);
         drop(fences);
+        #[cfg(feature = "diagnostics")]
+        if trace_memory_waits() {
+            tracing::info!(
+                timeline = ?Arc::as_ptr(queue),
+                wait = ?self.predicate,
+                "title queue paused for an unsatisfied memory wait"
+            );
+        }
         watch_notify();
         false
     }

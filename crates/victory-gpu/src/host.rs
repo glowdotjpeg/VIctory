@@ -18,6 +18,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 mod states;
+#[cfg(feature = "diagnostics")]
+mod removal_trace;
 pub(crate) use states::HostTexture;
 use states::RecordedTexture;
 
@@ -112,6 +114,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
         }
+        #[cfg(feature = "diagnostics")]
+        removal_trace::log();
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(
@@ -217,6 +221,10 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        #[cfg(feature = "diagnostics")]
+        if debug && std::env::var_os("VICTORY_D3D12_REMOVAL_STACK").is_some() {
+            removal_trace::register(&device);
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1185,6 +1193,17 @@ impl Host {
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 woken.add(what.write(at as *mut u8, bytes));
+                #[cfg(feature = "diagnostics")]
+                if crate::fence::trace_memory_waits() {
+                    tracing::trace!(
+                        frame = crate::queue::presented() + 1,
+                        fence = *submitted,
+                        address = format_args!("{at:#x}"),
+                        ?what,
+                        bytes,
+                        "applied title command list completion write"
+                    );
+                }
             }
         }
         self.log_messages();
