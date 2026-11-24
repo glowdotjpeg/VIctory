@@ -3659,6 +3659,67 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A second waterfall can reload the same per-lane descriptor for access
+    /// after the first waterfall measured its dimensions.
+    fn twin_loads(&self, a: Site, b: Site) -> bool {
+        let a = &self.x.p.blocks[a.0].insts[a.1];
+        let b = &self.x.p.blocks[b.0].insts[b.1];
+        if a.name() != b.name() {
+            return false;
+        }
+        let (
+            Fields::Smem {
+                base: Operand::Scalar { code: ba, .. },
+                offset: oa,
+                soffset: sa,
+                ..
+            },
+            Fields::Smem {
+                base: Operand::Scalar { code: bb, .. },
+                offset: ob,
+                soffset: sb,
+                ..
+            },
+        ) = (&a.fields, &b.fields)
+        else {
+            return false;
+        };
+        if oa != ob
+            || !(0..2).all(|k| {
+                let base = a.read(Reg::S(ba + k));
+                base.is_some() && base == b.read(Reg::S(bb + k))
+            })
+        {
+            return false;
+        }
+        match (sa, sb) {
+            (Operand::Scalar { code: NULL, .. }, Operand::Scalar { code: NULL, .. }) => true,
+            (Operand::Scalar { code: ca, .. }, Operand::Scalar { code: cb, .. }) => {
+                std::iter::zip(a.read(Reg::S(*ca)), b.read(Reg::S(*cb)))
+                    .any(|(x, y)| x == y || self.equivalent_first_lanes(x, y))
+            }
+            _ => false,
+        }
+    }
+
+    fn equivalent_first_lanes(&self, x: Value, y: Value) -> bool {
+        let first_lane_of = |value: Value| {
+            self.x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .filter(|inst| inst.name() == "v_readfirstlane_b32")
+                .find(|inst| inst.writes.iter().any(|&(_, written)| written == value))
+                .and_then(|inst| {
+                    inst.reads
+                        .iter()
+                        .find_map(|&(register, v)| matches!(register, Reg::V(_)).then_some(v))
+                })
+        };
+        first_lane_of(x).is_some_and(|v| first_lane_of(y) == Some(v))
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -3688,19 +3749,23 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
-            .x
-            .res
-            .descriptors
-            .iter()
-            .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
+        // The descriptor's own use, or a later load from the same address,
+        // supplies the kind of view when code only measures this copy.
+        let uses = |matches: &dyn Fn(Site) -> bool| {
+            self.x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|leaf| match *leaf {
+                        Source::Loaded { load, first } if matches(load) => Some((d.site, first)),
+                        _ => None,
+                    })
                 })
-            });
+        };
+        let use_at =
+            uses(&|load| load == site).or_else(|| uses(&|load| self.twin_loads(site, load)));
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };
@@ -8212,6 +8277,39 @@ mod tests {
                 validator.validate(&mut dxil).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn a_descriptor_load_can_use_the_dimensions_of_its_twin() {
+        let mut words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBF06_800A, // s_cmp_eq_u32 s10, 0 (record count)
+            0xBF85_0006, // s_cbranch_scc1 end
+            0xF408_0402,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[4:5], null
+            0xE030_2000,
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout.clone(), used.clone()).unwrap();
+        words[7] = 0xFA00_0010; // A different descriptor supplies no proof.
+        assert!(lower_with(&words, layout, used).is_err());
     }
 
     #[test]
