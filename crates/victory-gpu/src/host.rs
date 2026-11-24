@@ -1410,6 +1410,23 @@ impl Host {
                 let state_count = run.states.lock().unwrap_or_else(|e| e.into_inner()).len();
                 let (copies, writes) = {
                     let deferred = run.deferred();
+                    let frame = crate::queue::presented() + 1;
+                    if crate::capture::listed(frame) {
+                        let shader_writes: Vec<_> = deferred
+                            .copies
+                            .iter()
+                            .filter_map(|step| match step {
+                                Step::GpuWrite(_, at, len) => Some((*at, *len)),
+                                _ => None,
+                            })
+                            .collect();
+                        if !shader_writes.is_empty() {
+                            tracing::trace!(
+                                frame, index, next_fence = *submitted + 1, ?shader_writes,
+                                "captured shader write ranges"
+                            );
+                        }
+                    }
                     (deferred.copies.len(), deferred.writes.len())
                 };
                 let pipelines = run.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();

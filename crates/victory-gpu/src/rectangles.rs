@@ -770,7 +770,10 @@ fn probe_args(
             // SAFETY: the count copy filled the dword after the records.
             unsafe { (data as *const u32).add(records.len() * 4).read_unaligned() }
         });
-        tracing::info!(frame, %shader, max, ?live, ?records, "sampled indirect rectangle arguments");
+        tracing::info!(
+            frame, %shader, max, ?live, ?records, arguments = format_args!("{at:#x}"),
+            "sampled indirect rectangle arguments"
+        );
     });
 }
 
