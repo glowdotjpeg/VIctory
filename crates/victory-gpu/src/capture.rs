@@ -395,7 +395,9 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        42 => (4, Box::new(move |b| [u32_at(b, 0) as f32; 3])),
+        43 => (4, Box::new(move |b| [(u32_at(b, 0) as i32) as f32; 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
@@ -554,6 +556,15 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn integer_mask_targets_keep_small_values_visible() {
+        let rgba = Some(vec![0, 0, 0, 255, 255, 255, 255, 255]);
+        let unsigned = [0u32.to_le_bytes(), 1u32.to_le_bytes()].concat();
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &unsigned), rgba);
+        let signed = [(-1i32).to_le_bytes(), 0i32.to_le_bytes()].concat();
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &signed), rgba);
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
