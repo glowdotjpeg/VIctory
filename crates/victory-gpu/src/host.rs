@@ -796,8 +796,8 @@ mod tests {
 
     /// A title buffer for the synthetic ordering tests: the memory the
     /// test owns (`title`), with its host copy.
-    fn title_buffer(title: &mut Vec<u8>) -> std::sync::Arc<crate::shadow::Shadow> {
-        let at = title.as_ptr() as u64;
+    fn title_buffer(title: &mut [u8]) -> std::sync::Arc<crate::shadow::Shadow> {
+        let at = title.as_mut_ptr() as u64;
         crate::shadow::register(1, at, title.len() as u64);
         crate::shadow::find(at, title.len() as u64).unwrap()
     }
@@ -846,16 +846,16 @@ mod tests {
             2,
             "the copy must wait for the earlier list's write: one submission each"
         );
-        for (i, got) in title[4096..4096 + 256].chunks_exact(4).enumerate() {
+        for (i, &got) in title[4096..4096 + 256].as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
-                u32::from_le_bytes(got.try_into().unwrap()),
+                u32::from_le_bytes(got),
                 WRITE_PATTERN + i as u32,
                 "the copy read what the shaders wrote"
             );
         }
-        for (i, got) in title[..256].chunks_exact(4).enumerate() {
+        for (i, &got) in title[..256].as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
-                u32::from_le_bytes(got.try_into().unwrap()),
+                u32::from_le_bytes(got),
                 WRITE_PATTERN + i as u32,
                 "the write went back into title memory"
             );
@@ -908,9 +908,9 @@ mod tests {
             title[4096..4096 + 256].iter().all(|&b| b == 0xAA),
             "the copy read what was there when it ran"
         );
-        for (i, got) in title[..256].chunks_exact(4).enumerate() {
+        for (i, &got) in title[..256].as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
-                u32::from_le_bytes(got.try_into().unwrap()),
+                u32::from_le_bytes(got),
                 WRITE_PATTERN + i as u32,
                 "the write went back into title memory"
             );

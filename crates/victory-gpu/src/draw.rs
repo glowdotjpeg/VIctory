@@ -1642,6 +1642,27 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
     (stride != 0 && end <= u64::from(size)).then(|| u64::from(first) * stride)
 }
 
+/// Fixed-function state, straight onto the host list.
+pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+    // SAFETY: an open list.
+    unsafe { list.list.RSSetViewports(viewports) };
+}
+
+pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+    // SAFETY: an open list.
+    unsafe { list.list.RSSetScissorRects(rects) };
+}
+
+pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
+    // SAFETY: an open list.
+    unsafe { list.list.OMSetBlendFactor(factor) };
+}
+
+pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
+    // SAFETY: an open list.
+    unsafe { list.list.OMSetStencilRef(reference) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::{State, expanded_vertices, rect_source};
@@ -1680,25 +1701,4 @@ mod tests {
         assert_eq!(expanded_vertices(u32::MAX / 6 * 3), Some(u32::MAX / 6 * 6));
         assert_eq!(expanded_vertices(u32::MAX), None);
     }
-}
-
-/// Fixed-function state, straight onto the host list.
-pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetViewports(viewports) };
-}
-
-pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetScissorRects(rects) };
-}
-
-pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
-    // SAFETY: an open list.
-    unsafe { list.list.OMSetBlendFactor(factor) };
-}
-
-pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
-    // SAFETY: an open list.
-    unsafe { list.list.OMSetStencilRef(reference) };
 }
