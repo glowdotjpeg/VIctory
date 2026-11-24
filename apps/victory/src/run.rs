@@ -16,6 +16,11 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    anyhow::ensure!(
+        !execute || cfg!(feature = "diagnostics") || std::env::var_os("VICTORY_D3D12_WARP").is_none(),
+        "VICTORY_D3D12_WARP requires a diagnostics build: cargo build --profile diag -p victory --features diagnostics"
+    );
+
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
