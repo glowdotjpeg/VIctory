@@ -164,7 +164,16 @@ fn queue(p: Arc<Pending>) {
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let receiver = Arc::new(Mutex::new(receiver));
+        let single_warp_worker = cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+            && std::env::var_os("VICTORY_WARP_SERIAL_PSO").is_some();
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = if single_warp_worker {
+            tracing::info!("WARP pipeline creation limited to one worker");
+            1
+        } else {
+            workers
+        };
         for i in 0..workers {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
