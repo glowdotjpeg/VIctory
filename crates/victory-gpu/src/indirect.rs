@@ -60,9 +60,17 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    uint used;
+    budget.InterlockedCompareExchange(0, 0, 0, used);
+    bool allowed = cost == 0;
+    [allow_uav_condition]
+    while (!allowed && used < BUDGET && cost <= BUDGET - used) {
+        uint observed;
+        budget.InterlockedCompareExchange(0, used, used + cost, observed);
+        allowed = observed == used;
+        used = observed;
+    }
+    if (!allowed) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
     }
@@ -216,6 +224,44 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_records_do_not_wrap_the_indirect_work_budget() {
+        let Some(host) = host() else { return };
+        const LARGE_RECORDS: u32 = 64;
+        const STRIDE: u32 = 16;
+        let (buffer, data) = host
+            .shared_buffer(u64::from((LARGE_RECORDS + 1) * STRIDE))
+            .unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the buffer's CPU mapping contains every record. The GPU
+        // reads it after submission and the CPU checks it after the fence.
+        let gpu = unsafe {
+            for i in 0..=LARGE_RECORDS {
+                let count = if i < LARGE_RECORDS { 1 << 24 } else { 3 };
+                data.add((i * STRIDE) as usize)
+                    .cast::<[u32; 4]>()
+                    .write([count, 4, 0, 0]);
+            }
+            buffer.GetGPUVirtualAddress()
+        };
+        assert!(bound(&list, &buffer, gpu, (0, STRIDE, LARGE_RECORDS)));
+        assert!(bound(
+            &list,
+            &buffer,
+            gpu + u64::from(LARGE_RECORDS * STRIDE),
+            (0, STRIDE, 1)
+        ));
+        list.close();
+        host.execute(&[&list], "test indirect argument budget");
+        let vertex_count = |i: u32| unsafe {
+            data.add((i * STRIDE) as usize).cast::<u32>().read_volatile()
+        };
+        assert_eq!((0..LARGE_RECORDS).filter(|&i| vertex_count(i) != 0).count(), 2);
+        assert_eq!(vertex_count(LARGE_RECORDS), 0);
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
