@@ -217,6 +217,10 @@ impl Staging {
         if watched {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::mode() == 2 {
+                read.fill(0);
+            }
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
             self.detile(read);
             #[cfg(feature = "diagnostics")]
@@ -511,8 +515,9 @@ mod tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
-        VirtualAlloc, VirtualFree,
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION,
+        PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        VirtualQuery,
     };
 
     /// RAII guard for a `VirtualAlloc(..., MEM_RESERVE, ...)` address range.
@@ -647,6 +652,47 @@ mod tests {
         region.commit(TILE, TILE);
         region.commit(2 * TILE, 2 * TILE);
         assert_eq!(read_resident(region.ptr, &mut dst), Residency::Full);
+    }
+
+    #[test]
+    fn partial_residency_skips_inaccessible_committed_pages() {
+        const PAGE: usize = 4096;
+        let region = VirtualRegion::reserve(4 * PAGE);
+        region.commit(0, 4 * PAGE);
+        let samples = vec![0x51; 4 * PAGE];
+        let mut old_protection = 0;
+        // SAFETY: all four pages belong to this allocation and are committed.
+        unsafe {
+            region.write_slice(0, &samples);
+            for (offset, protection) in
+                [(PAGE, PAGE_READWRITE | PAGE_GUARD), (2 * PAGE, PAGE_NOACCESS)]
+            {
+                assert_ne!(
+                    VirtualProtect(
+                        region.ptr.add(offset).cast(), PAGE, protection, &mut old_protection,
+                    ),
+                    0,
+                );
+            }
+        }
+
+        let mut read = vec![0xCA; 4 * PAGE];
+        let Residency::Partial(intervals) = read_resident(region.ptr, &mut read) else {
+            panic!("only the first and last pages should be readable");
+        };
+        assert_eq!(intervals, [(0, PAGE), (3 * PAGE, 4 * PAGE)]);
+        zero_gaps(&mut read, &intervals);
+        assert_eq!(&read[..PAGE], &samples[..PAGE]);
+        assert!(read[PAGE..3 * PAGE].iter().all(|&byte| byte == 0));
+        assert_eq!(&read[3 * PAGE..], &samples[3 * PAGE..]);
+
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: the guard page is in this allocation and `info` is a valid output.
+        let queried = unsafe {
+            VirtualQuery(region.ptr.add(PAGE).cast(), &mut info, size_of_val(&info))
+        };
+        assert_ne!(queried, 0);
+        assert_ne!(info.Protect & PAGE_GUARD, 0);
     }
 
     fn readback_mip(
