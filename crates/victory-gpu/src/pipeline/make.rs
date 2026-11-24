@@ -12,9 +12,8 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! A first pass can miss the budget. If its pipeline is made later, it is
+//! still saved as a candidate to start earlier on the next run.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -32,6 +31,8 @@ pub(crate) struct Pending {
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
+    /// A use reached the frame's wait path. Written and read under `DONE`.
+    waited: AtomicBool,
     used: AtomicBool,
 }
 
@@ -55,16 +56,29 @@ impl Pending {
             queued: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
+            waited: AtomicBool::new(false),
             used: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
+        let made = self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
+        let used = {
+            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            done.notify_all();
+            made.is_some() && self.waited.load(Ordering::Relaxed)
+        };
+        if used {
+            self.remember_use();
+        }
+    }
+
+    fn remember_use(&self) {
+        if !self.used.swap(true, Ordering::Relaxed) {
+            super::library::note_used(&self.key);
+        }
     }
 }
 
@@ -113,8 +127,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         wait(p, crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
+    if made.is_some() {
+        p.remember_use();
     }
     made
 }
@@ -147,6 +161,7 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    p.waited.store(true, Ordering::Relaxed);
     while p.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
@@ -243,5 +258,6 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+        assert!(!p.used.load(Ordering::Relaxed));
     }
 }
