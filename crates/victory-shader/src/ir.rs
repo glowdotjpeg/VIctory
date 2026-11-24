@@ -57,6 +57,9 @@ pub struct Block {
     pub preds: Vec<usize>,
     pub phis: Vec<Phi>,
     pub insts: Vec<Inst>,
+    /// Instruction positions at which a native wait drains LGKM. The wait
+    /// itself has no register effects, so it is kept outside the SSA stream.
+    pub(crate) lgkm_waits: Vec<usize>,
     pub exit: Exit,
 }
 
@@ -158,6 +161,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             preds: Vec::new(),
             phis: Vec::new(),
             insts: Vec::new(),
+            lgkm_waits: Vec::new(),
             exit: Exit::End,
         })
         .collect();
@@ -184,6 +188,10 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 Flow::Stop if name == "s_setpc_b64" => Exit::Indirect,
                 Flow::Stop => Exit::End,
             };
+        }
+        if name == "s_waitcnt" && matches!(fields, Fields::Sopp { imm } if imm >> 8 & 0x3F == 0) {
+            let block = &mut blocks[b];
+            block.lgkm_waits.push(block.insts.len());
         }
         if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
@@ -636,7 +644,7 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
     }
 }
 
-/// Scheduling hints, performance counters and tracing: no effect on results.
+/// Scheduling hints, wait counters and tracing have no SSA effects.
 const DROPPED: &[&str] = &[
     "s_nop",
     "s_waitcnt",

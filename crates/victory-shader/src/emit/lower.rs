@@ -94,6 +94,57 @@ fn is_mesh_alloc(inst: &Inst) -> bool {
         && matches!(inst.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
 }
 
+/// The two ORs of a single-wave LDS reduction, around which to fence.
+fn lds_reduction(x: &Parts) -> Option<[usize; 2]> {
+    let entry = &x.p.blocks[0];
+    // Plain LDS stores and loads communicate with other lanes' atomics.
+    // Atomic ordering alone does not make all lanes finish either phase.
+    // The entry has no incoming control flow. Lowered EXEC guards join before
+    // the next native instruction, so both fences execute in every thread.
+    if !entry.preds.is_empty() || entry.lgkm_waits.len() < 2 {
+        return None;
+    }
+    let is_lds = |inst: &Inst| {
+        matches!(
+            inst.fields,
+            Fields::Ds { .. } | Fields::Buffer { lds: true, .. }
+        ) || inst.name() == "s_barrier"
+    };
+    let mut accesses = entry.insts.iter().enumerate().filter(|(_, i)| is_lds(i));
+    let (init, init_inst) = accesses.next()?;
+    let (first, first_inst) = accesses.next()?;
+    let (last, last_inst) = accesses.next()?;
+    let guard = x.st.guards[0][init]?;
+    if accesses.next().is_some()
+        || init_inst.name() != "ds_write2_b32"
+        || first_inst.name() != "ds_or_b32"
+        || last_inst.name() != "ds_or_b32"
+        || x.st.guards[0][first].is_some()
+        || x.st.guards[0][last].is_some()
+    {
+        return None;
+    }
+    let Exit::Branch { not_taken, .. } = entry.exit else {
+        return None;
+    };
+    let reader = &x.p.blocks[not_taken];
+    if entry.insts.last()?.name() != "s_cbranch_execz"
+        || reader.preds != [0]
+        || x.st.reach[not_taken] != guard
+        || reader.insts.iter().find(|i| is_lds(i))?.name() != "ds_read2_b32"
+    {
+        return None;
+    }
+    let writes_exec = |i: usize| {
+        let inst = &entry.insts[i];
+        inst.write(Reg::S(EXEC)).is_some() || inst.write(Reg::S(EXEC + 1)).is_some()
+    };
+    let restore = (init + 1..first).rev().find(|&i| writes_exec(i))?;
+    let narrow = (last + 1..entry.insts.len()).find(|&i| writes_exec(i))?;
+    let waited = |from, to| entry.lgkm_waits.iter().any(|&i| from < i && i <= to);
+    (waited(restore, first) && waited(last, narrow)).then_some([first, last])
+}
+
 struct MeshCountsPlan {
     request: Site,
     packed: Value,
@@ -383,6 +434,8 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// Entry-block LDS reduction with native completion waits.
+    lds_reduction: Option<[usize; 2]>,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -656,6 +709,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut reduction = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -707,6 +761,9 @@ impl<'a> Lower<'a> {
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+            if one_wave && s.lds_dwords > 0 {
+                reduction = lds_reduction(x);
             }
         }
         let mut no_barrier = HashSet::new();
@@ -791,6 +848,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            lds_reduction: reduction,
             src0: None,
             console_lanes,
             flat: None,
@@ -2364,9 +2422,7 @@ impl<'a> Lower<'a> {
 
     fn mesh_counts_begin(&mut self) {
         let c = self.cur;
-        let mode = self.s.m.i32(1 | 8);
-        self.s
-            .op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        self.group_barrier(false);
         let lds = self.s.lds();
         let zero = self.s.m.i32(0);
         let ptr = self.s.m.element(c, lds, zero);
@@ -2387,6 +2443,18 @@ impl<'a> Lower<'a> {
         let p = self.s.m.select(c, no_vertices, zero, p);
         self.mesh_counts = Some((v, p));
         self.mesh_declare_counts(v, p);
+    }
+
+    fn group_barrier(&mut self, fence_uavs: bool) {
+        let mode = self.s.m.i32(if fence_uavs { 1 | 2 | 8 } else { 1 | 8 });
+        self.s.op(
+            self.cur,
+            "barrier",
+            Attr::NoDuplicate,
+            self.s.t.void,
+            80,
+            &[mode],
+        );
     }
 
     fn mesh_declare_counts(&mut self, v: V, p: V) {
@@ -2731,6 +2799,9 @@ impl<'a> Lower<'a> {
             None => self.s.m.i32(0),
         };
         let p = dword(self, offset);
+        if b == 0 && self.lds_reduction.is_some_and(|[first, _]| i == first) {
+            self.group_barrier(false);
+        }
         let at = self.begin_guarded(guard);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
@@ -2743,6 +2814,9 @@ impl<'a> Lower<'a> {
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
+        }
+        if b == 0 && self.lds_reduction.is_some_and(|[_, last]| i == last) {
+            self.group_barrier(false);
         }
         Ok(())
     }
@@ -2796,11 +2870,7 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.group_barrier(self.writes_uavs);
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -7644,6 +7714,10 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 #[path = "mesh_counts_tests.rs"]
 mod mesh_counts_tests;
+
+#[cfg(all(test, windows))]
+#[path = "lds_reduction_tests.rs"]
+mod lds_reduction_tests;
 
 #[cfg(test)]
 mod tests {
