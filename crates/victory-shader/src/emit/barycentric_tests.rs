@@ -72,9 +72,9 @@ fn pixel(
     let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
     let c = Container::parse(&bytes)?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
-    let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
     let ps = emit(&c, &native, &p, &st, &io, &res)?;
     validate(&ps.dxil);
     Ok(ps)
