@@ -79,14 +79,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
-    let took = started.elapsed();
-    note_watch_cost(took, span);
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, took.as_micros() as u64);
-    }
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -96,6 +88,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } else {
         Vec::new()
     };
+    let took = started.elapsed();
+    note_watch_cost(took, span);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, took.as_micros() as u64);
+    }
     j.asked += 1;
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
