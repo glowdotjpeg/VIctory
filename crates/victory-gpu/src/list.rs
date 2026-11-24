@@ -878,10 +878,12 @@ extern "system" fn copy_texture_region(
         if dst_subresource >= to.subresource_count() {
             return;
         }
-        let src_footprint = (src.kind == FOOTPRINT).then(|| {
+        let src_footprint = if src.kind == FOOTPRINT {
             // SAFETY: the footprint tag selects this member.
-            unsafe { src.data.footprint }
-        });
+            Some(unsafe { src.data.footprint })
+        } else {
+            None
+        };
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
