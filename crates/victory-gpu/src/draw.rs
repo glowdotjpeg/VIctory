@@ -590,13 +590,15 @@ impl State {
                 #[cfg(feature = "diagnostics")]
                 if crate::pipeline::selected_for_diagnostics(&stage.shader.hash) {
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
-                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
+                    let frame = crate::queue::presented() + 1;
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 || crate::capture::listed(frame) {
                         let slot_zero = (self.heaps[0] != 0)
                             .then(|| crate::descriptor::heap(self.heaps[0] as This))
                             .and_then(|heap| heap.host())
                             .and_then(|heap| heap.describe_slot(0));
                         tracing::info!(
                             shader = %stage.shader.hash,
+                            frame,
                             list = ?l.as_raw(),
                             ?slot_zero,
                             user_data = ?t.host.user_data,
@@ -1500,8 +1502,17 @@ fn describe(view: Option<&View>) -> String {
     };
     match view {
         None => "no view".into(),
+        Some(View::Shader(0, desc)) => {
+            format!("null SRV {:?}", desc.as_ref().map(|d| (d[0], d[1])))
+        }
+        Some(View::Unordered(0, _, desc)) => {
+            format!("null UAV {:?}", desc.as_ref().map(|d| (d[0], d[1])))
+        }
         Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+            .unwrap_or_else(|| match crate::descriptor::host::buffer_range(v) {
+                Some(range) => format!("buffer Some({range:?})"),
+                None => format!("SRV for {r:#x} has no host texture or buffer range"),
+            }),
         // A buffer has no host texture: its title range, as for a shader view.
         Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
             || format!("uav buffer {:?}", crate::descriptor::host::buffer_range(v)),
@@ -1517,12 +1528,16 @@ fn describe(view: Option<&View>) -> String {
             u64::from(d[10]) | u64::from(d[11]) << 32
         ),
         // The first four values, as a colour rectangle's constants are.
-        Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
-        {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+        Some(View::Constant(address, size)) if *size >= 16 => {
+            let mut bytes = [0; 16];
+            if crate::host::read_into(*address as *const u8, &mut bytes) {
+                let v: [f32; 4] = std::array::from_fn(|i| {
+                    f32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
+                });
+                format!("Constant({address:#x}, {size}) {v:?}")
+            } else {
+                format!("Constant({address:#x}, {size}) unreadable")
+            }
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }

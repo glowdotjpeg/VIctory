@@ -100,13 +100,18 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+/// Diagnostic shader selection accepts a comma-separated list of hashes.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn selected_for_diagnostics(hash: &str) -> bool {
     static SELECTED: OnceLock<Option<String>> = OnceLock::new();
     SELECTED
         .get_or_init(|| std::env::var("VICTORY_DUMP_SHADER_MATCH").ok())
         .as_deref()
-        .is_some_and(|selected| selected.eq_ignore_ascii_case(hash))
+        .is_some_and(|selected| {
+            selected
+                .split(',')
+                .any(|candidate| candidate.trim().eq_ignore_ascii_case(hash))
+        })
 }
 
 #[cfg(windows)]
