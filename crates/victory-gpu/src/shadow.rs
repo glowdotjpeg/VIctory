@@ -855,8 +855,7 @@ mod copy_back_tests {
 
         // Another copy of the same title memory: the journal tells it what
         // the copy back wrote and the kernel what the title wrote.
-        let (other, other_data) = host()
-            .expect("D3D12")
+        let (other, other_data) = host
             .shared_buffer(4 * PAGE as u64)
             .expect("test buffer");
         let other = Shadow::new(other, other_data, 0, title as u64, 4 * PAGE as u64);
