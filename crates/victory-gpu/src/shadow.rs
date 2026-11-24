@@ -121,6 +121,19 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
+/// Ascending pages as inclusive-exclusive runs of neighbours (a copy back
+/// queries each run's span, or the whole range when the runs are too many).
+fn page_runs(pages: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &page in pages {
+        match runs.last_mut() {
+            Some((_, end)) if *end == page => *end = page + 1,
+            _ => runs.push((page, page + 1)),
+        }
+    }
+    runs
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -295,16 +308,42 @@ impl Shadow {
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
+            // Asking the kernel about the whole range for this would walk
+            // every page of it and clear the title's bits on the pages
+            // nobody synced; asking about the synced pages' runs walks only
+            // them, and what the title wrote elsewhere keeps its bit until
+            // the next refresh asks (the journal has no record of a write
+            // that has not been reported yet, so the bit is all there is).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
+            if first < last && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+                synced.retain(|&p| (first..last).contains(&p));
+                if !synced.is_empty() {
+                    let runs = page_runs(&synced);
+                    let base = start / PAGE;
+                    if crate::watch::narrow_wins(runs.len(), synced.len(), last - first) {
+                        let epochs = runs
+                            .iter()
+                            .map(|&(a, b)| {
+                                crate::watch::writes(a * PAGE, b * PAGE, true).map(|(n, _)| n)
+                            })
+                            .collect::<Option<Vec<_>>>();
+                        // Each page with the epoch of the query that covered
+                        // it: an entry another user journals for it later,
+                        // between the runs or after them, stays above. A
+                        // failed query leaves the old epochs in place.
+                        if let Some(epochs) = epochs {
+                            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                            for ((a, b), epoch) in runs.into_iter().zip(epochs) {
+                                copied[a - base..b - base].fill(epoch);
+                            }
+                        }
+                    } else if let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+                    {
+                        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                        for &page in &synced {
+                            copied[page - base] = now;
+                        }
+                    }
                 }
             }
         }
@@ -646,6 +685,16 @@ mod tests {
         assert!(unchanged.differs(0, &[0, 0, 0, 1], &[0; 4]));
     }
 
+    #[test]
+    fn neighbouring_pages_make_one_run() {
+        assert_eq!(page_runs(&[]), []);
+        assert_eq!(page_runs(&[7]), [(7, 8)]);
+        assert_eq!(
+            page_runs(&[5, 6, 7, 9, 20, 21]),
+            [(5, 8), (9, 10), (20, 22)]
+        );
+    }
+
     // Both versions walk exactly the same declared ranges, in their
     // original order. Only the page comparison differs.
     fn scan(
@@ -737,5 +786,100 @@ mod tests {
             cached[2],
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
+    }
+}
+
+/// Copy back against real write-watched title memory (a device is needed
+/// for the copy itself, so the diagnostics build and, without a GPU,
+/// `VICTORY_D3D12_WARP=1`).
+#[cfg(all(test, feature = "diagnostics"))]
+mod copy_back_tests {
+    use super::*;
+    use crate::fence::Woken;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    // 0x20_0000, `MEM_WRITE_WATCH` (in SystemServices in windows-sys).
+    const WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn copy_back_keeps_the_title_writes_of_untouched_pages() {
+        let Some(host) = host() else { return };
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(title, 0);
+        let (buffer, data) = host
+            .shared_buffer(4 * PAGE as u64)
+            .expect("test buffer");
+        let shadow = Shadow::new(buffer, data, 0, title as u64, 4 * PAGE as u64);
+        let mut woken = Woken::default();
+
+        shadow.writing(title, 4 * PAGE);
+        // The shaders write page 1 of the copy while the list runs.
+        // SAFETY: the test owns this mapping.
+        unsafe { data.add(PAGE + 8).write(0xFF) };
+        // The title's threads write pages 2 and 3 of title memory meanwhile.
+        // SAFETY: committed pages of ours.
+        unsafe {
+            (title as *mut u8).add(2 * PAGE + 8).write(0x22);
+            (title as *mut u8).add(3 * PAGE + 8).write(0x11);
+        }
+
+        let written = shadow.copy_back(title, 4 * PAGE, &mut woken);
+        assert_eq!(written, PAGE, "only the shaders' page is copied back");
+        // SAFETY: committed pages of ours.
+        assert_eq!(unsafe { (title as *const u8).add(PAGE + 8).read() }, 0xFF);
+        // SAFETY: the test owns this mapping.
+        assert_eq!(unsafe { data.add(2 * PAGE + 8).read() }, 0, "untouched");
+        // The title's page 3 write was not reported by the copy back's
+        // narrow queries, so its bit must still be there for the next ask.
+        let (_, reported) =
+            crate::watch::writes(title + 3 * PAGE, title + 4 * PAGE, false).expect("watched");
+        assert_eq!(reported.len(), 1, "page 3's write is still reported");
+        assert_eq!(reported[0].0, title / PAGE + 3);
+
+        // The next refresh takes the title's page 3 over (its bit, or the
+        // journal a broader query left).
+        assert_eq!(shadow.update(title + 3 * PAGE, PAGE), PAGE);
+        // SAFETY: the test owns this mapping.
+        assert_eq!(unsafe { data.add(3 * PAGE + 8).read() }, 0x11);
+        // The synced page is current: the next refresh does not recopy it.
+        assert_eq!(shadow.update(title + PAGE, PAGE), 0);
+
+        // Another copy of the same title memory: the journal tells it what
+        // the copy back wrote and the kernel what the title wrote.
+        let (other, other_data) = host()
+            .expect("D3D12")
+            .shared_buffer(4 * PAGE as u64)
+            .expect("test buffer");
+        let other = Shadow::new(other, other_data, 0, title as u64, 4 * PAGE as u64);
+        let copied = other.update(title, 4 * PAGE);
+        // The copy back's page (through the journal) and the title's two
+        // (one through the journal, one through the kernel's bit); the
+        // journal may also carry older entries for pages a freed
+        // allocation had at these addresses, so page 0 may come along.
+        assert!(copied >= 3 * PAGE);
+        // SAFETY: the test owns this mapping; the reads are of pages the
+        // copy back and the title wrote.
+        let (a, b, c) = unsafe {
+            (
+                other_data.add(PAGE + 8).read(),
+                other_data.add(2 * PAGE + 8).read(),
+                other_data.add(3 * PAGE + 8).read(),
+            )
+        };
+        assert_eq!(a, 0xFF);
+        assert_eq!(b, 0x22);
+        assert_eq!(c, 0x11);
+
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
     }
 }

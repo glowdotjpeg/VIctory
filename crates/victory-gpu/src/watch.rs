@@ -20,6 +20,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::Duration;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -36,6 +38,13 @@ struct Journal {
     /// Room for the kernel's answer.
     found: Vec<usize>,
 }
+
+/// Mean cost of a query of a small span, nanoseconds. One query's cost is a
+/// fixed part plus a walk over its pages, so callers choosing between many
+/// narrow queries and one broad one need both this and the per page walk.
+static SMALL_NS: AtomicU64 = AtomicU64::new(2_000);
+/// Mean walk cost per page of a query of a big span, nanoseconds.
+static BIG_NS: AtomicU64 = AtomicU64::new(85);
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
@@ -54,10 +63,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    let span = (last - first) * PAGE;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
@@ -70,6 +79,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    let took = started.elapsed();
+    note_watch_cost(took, span);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, took.as_micros() as u64);
+    }
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -79,12 +96,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } else {
         Vec::new()
     };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-    }
     j.asked += 1;
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
@@ -98,6 +109,47 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// Records a query's cost: one average for small spans (mostly the fixed
+/// part of a call), one per page for big spans (mostly the walk), so that
+/// [`narrow_wins`] can compare splitting a query against walking it whole.
+fn note_watch_cost(took: Duration, span: usize) {
+    let ns = took.as_nanos() as u64;
+    if span < 2 << 20 {
+        ewma(&SMALL_NS, ns);
+    } else if span >= 16 << 20 {
+        let pages = (span / PAGE) as u64;
+        ewma(&BIG_NS, ns / pages);
+    }
+}
+
+/// Moves an average a sixteenth of the way to `sample`.
+fn ewma(slot: &AtomicU64, sample: u64) {
+    let _ = slot.fetch_update(Relaxed, Relaxed, |old| {
+        Some(old.saturating_sub(old / 16) + sample.min(u64::MAX / 16) / 16)
+    });
+}
+
+/// Whether querying `runs` separate spans that together cover `synced`
+/// pages costs less than one query of `span` pages, by the costs measured
+/// here lately. Used by a copy back that only needs the kernel's bits of
+/// the pages it synced: asking for the whole declared range would walk
+/// every page of it and clear the title's bits on the rest.
+pub(crate) fn narrow_wins(runs: usize, synced: usize, span: usize) -> bool {
+    narrow_wins_on(
+        runs as u64,
+        synced as u64,
+        span as u64,
+        SMALL_NS.load(Relaxed),
+        BIG_NS.load(Relaxed),
+    )
+}
+
+/// [`narrow_wins`] with the costs given: pages of each, `small` and `big`
+/// in nanoseconds (a call, and its walk per page).
+fn narrow_wins_on(runs: u64, synced: u64, span: u64, small: u64, big: u64) -> bool {
+    runs * small + synced * big < small + span * big
 }
 
 /// Guarded blocks of view memory.
@@ -290,6 +342,21 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// Drops the journal's entries for `[from, to)`: freed allocations
+    /// leave theirs behind, and a fresh one at the same pages must not
+    /// inherit them.
+    fn forget(from: usize, to: usize) {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<usize> = j
+            .written
+            .range(from / PAGE..to.div_ceil(PAGE))
+            .map(|(&p, _)| p)
+            .collect();
+        for key in keys {
+            j.written.remove(&key);
+        }
+    }
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -303,6 +370,7 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        forget(start, end);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
@@ -377,5 +445,224 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// Querying a span leaves the kernel's bits of pages outside it: a copy
+    /// back that queries only the pages it synced must not clear what the
+    /// title wrote elsewhere in the range (the journal is no substitute; the
+    /// kernel's bit is the only record of a write nobody has copied yet).
+    #[test]
+    fn a_narrow_query_leaves_neighbouring_bits_set() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 4 * PAGE);
+        forget(start, end);
+        writes(start, end, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 3 * PAGE + 8) as *mut u8).write(1) };
+        // The synced span only: what a copy back would query.
+        let (now, _) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
+        let (later, pages) = writes(p + 3 * PAGE, p + 4 * PAGE, false).expect("watched");
+        assert!(later > now);
+        // The journal can only date the write to the asking that found it.
+        assert_eq!(pages, [(p / PAGE + 3, later)]);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Splitting a query beats walking the whole span when the runs' fixed
+    /// costs are less than the walk the split saves; one run always wins,
+    /// many expensive calls lose.
+    #[test]
+    fn narrow_queries_win_by_the_measured_costs() {
+        let (small, big) = (2_000, 85);
+        // One run of one page in a four page span: always less to walk.
+        assert!(narrow_wins_on(1, 1, 4, small, big));
+        // A dozen runs in a 174 MiB span, the world's copy back: cheap.
+        assert!(narrow_wins_on(12, 12, 2_784, small, big));
+        // Sixty-four runs of one page each are still less than walking
+        // 174 MiB here.
+        assert!(narrow_wins_on(64, 64, 2_784, small, big));
+        // With calls costing a millisecond apiece, three narrow calls lose
+        // to one broad one whose walk costs 100 ns a page.
+        assert!(!narrow_wins_on(3, 3, 2_784, 1_000_000, 100));
+        // And they win once the walk is dear enough per page.
+        assert!(narrow_wins_on(3, 3, 2_784, 1_000_000, 100_000));
+    }
+
+    // Informational: whether a kernel write (`WriteProcessMemory`, what a
+    // copy back does) leaves a write-watch bit. Print, do not assert.
+    #[test]
+    fn write_process_memory_leaves_a_bit_or_not() {
+        use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        forget(p, p + 2 * PAGE);
+        writes(p, p + 2 * PAGE, false).expect("watched");
+        let mut done = 0;
+        let bytes = [7u8; 16];
+        // SAFETY: committed pages of ours.
+        let ok = unsafe {
+            WriteProcessMemory(
+                GetCurrentProcess(),
+                (p + PAGE) as _,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                &mut done,
+            )
+        };
+        let (_, pages) = writes(p, p + 2 * PAGE, false).expect("watched");
+        println!(
+            "WriteProcessMemory ok={ok} done={done}: write watch reports {} pages {pages:?}",
+            pages.len()
+        );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    // cargo test --release -p victory-gpu benchmark_write_watch -- --ignored --nocapture
+    #[test]
+    #[ignore = "synthetic CPU benchmark, commits ~10 GiB"]
+    fn benchmark_write_watch() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // 0x20_0000, `MEM_WRITE_WATCH` (in SystemServices in windows-sys).
+        const WATCH: u32 = 0x20_0000;
+        // The title keeps 9-13 GiB write-watched; the walk's cost may depend
+        // on the process's page tables, not just the span.
+        const POOL: usize = 10 << 30;
+        // SAFETY: committed and freed at the end of the test.
+        let pool = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                POOL,
+                MEM_RESERVE | MEM_COMMIT | WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(pool, 0);
+        // Touch it all: the title's watched memory is committed and written.
+        let started = Instant::now();
+        for at in (0..POOL).step_by(4096) {
+            // SAFETY: committed pages of ours.
+            unsafe { *((pool + at) as *mut u8) = 1 };
+        }
+        println!("touched 10 GiB in {:?}", started.elapsed());
+        // A first query of everything, so later ones measure steady state.
+        let started = Instant::now();
+        let (_, n) = writes(pool, pool + POOL, false).expect("watched");
+        println!(
+            "first whole query: {:?}, {} pages",
+            started.elapsed(),
+            n.len()
+        );
+
+        let median = |mut times: Vec<u128>| {
+            times.sort_unstable();
+            times[times.len() / 2]
+        };
+        // Per span: the walk's cost, with a few dirty pages to report.
+        for mb in [1usize, 4, 16, 64, 174, 256] {
+            let bytes = mb << 20;
+            let (from, to) = (pool, pool + bytes);
+            for page in (0..bytes / PAGE).step_by(bytes / PAGE / 8) {
+                // SAFETY: committed pages of ours.
+                unsafe { *((from + page * PAGE) as *mut u8) = 2 };
+            }
+            let mut calls = Vec::new();
+            for _ in 0..21 {
+                let started = Instant::now();
+                black_box(writes(from, to, false).expect("watched"));
+                calls.push(started.elapsed().as_micros());
+            }
+            let us = median(calls);
+            println!(
+                "span {mb:>4} MiB: {us:>5} us/call, {:.1} us/MiB, dirty 8 pages",
+                us as f64 / mb as f64,
+            );
+        }
+        // Dirty-page count at a fixed span.
+        for dirty in [0usize, 64, 1024] {
+            let (from, to) = (pool, pool + (64 << 20));
+            for page in (0..dirty).map(|i| i * (64 << 20) / dirty.max(1) / PAGE) {
+                // SAFETY: committed pages of ours.
+                unsafe { *((from + page * PAGE) as *mut u8) = 3 };
+            }
+            let mut calls = Vec::new();
+            for _ in 0..21 {
+                let started = Instant::now();
+                black_box(writes(from, to, false).expect("watched"));
+                calls.push(started.elapsed().as_micros());
+            }
+            println!(
+                "span 64 MiB, {} dirty pages: {} us/call",
+                dirty,
+                median(calls)
+            );
+        }
+        // A copy back's choice: one broad query of the declared range, or
+        // narrow ones over the pages it synced (here 12 pages in 3 runs of a
+        // 174 MiB range, the world's big heap).
+        let bytes = 174 << 20;
+        let (from, to) = (pool, pool + bytes);
+        let synced = [
+            7usize, 8, 9, 600, 601, 1200, 1300, 1301, 1302, 1303, 2000, 2650,
+        ];
+        for page in synced {
+            // SAFETY: committed pages of ours.
+            unsafe { *((from + page * PAGE) as *mut u8) = 4 };
+        }
+        let mut broad = Vec::new();
+        for _ in 0..21 {
+            let started = Instant::now();
+            black_box(writes(from, to, false).expect("watched"));
+            broad.push(started.elapsed().as_micros());
+        }
+        let mut narrow = Vec::new();
+        for _ in 0..21 {
+            let started = Instant::now();
+            let mut runs = Vec::new();
+            let mut run: Option<(usize, usize)> = None;
+            for &page in &synced {
+                match run {
+                    Some((a, b)) if b == page => run = Some((a, page + 1)),
+                    Some(done) => {
+                        runs.push(done);
+                        run = Some((page, page + 1));
+                    }
+                    None => run = Some((page, page + 1)),
+                }
+            }
+            runs.extend(run);
+            for (a, b) in runs {
+                black_box(writes(from + a * PAGE, from + b * PAGE, false).expect("watched"));
+            }
+            narrow.push(started.elapsed().as_micros());
+        }
+        println!(
+            "copy back over 174 MiB, 12 synced pages in 3 runs: broad {} us, narrow {} us",
+            median(broad),
+            median(narrow),
+        );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(pool as *mut _, 0, MEM_RELEASE) };
     }
 }
