@@ -58,7 +58,7 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
     );
     let depth = texture(
         host,
-        DXGI_FORMAT_D24_UNORM_S8_UINT,
+        DXGI_FORMAT_R24G8_TYPELESS,
         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
         D3D12_RESOURCE_STATE_DEPTH_WRITE,
     );
@@ -68,24 +68,34 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
         D3D12_RESOURCE_STATE_RENDER_TARGET,
     );
-    let dsv = host.dsv(&depth, None);
+    let dsv = host.dsv(
+        &depth,
+        Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        }),
+    );
     let rtv = host.rtv(&target, None);
 
     const SOURCE: &str = r#"
-        #define RS "DescriptorTable(SRV(t0))"
+        #define RS "DescriptorTable(SRV(t0)),RootConstants(num32BitConstants=1,b0)"
         Texture2D<float> input_depth : register(t0);
         RWTexture2D<float> output_depth : register(u0);
-        [RootSignature("DescriptorTable(UAV(u0))")]
+        cbuffer Params : register(b0) { float test_depth; }
+        [RootSignature("DescriptorTable(UAV(u0)),DescriptorTable(SRV(t0))")]
         [numthreads(4, 4, 1)] void write_depth(uint3 id : SV_DispatchThreadID) {
-            output_depth[id.xy] = id.x < 2 ? 0.25 : 0.75;
+            output_depth[id.xy] = id.x < 2 ? input_depth.Load(int3(id.xy, 0)) : 0.75;
         }
         [RootSignature(RS)] float4 vs(uint i: SV_VertexID) : SV_Position {
-            return float4(i == 2 ? 3 : -1, i == 1 ? -3 : 1, 0.5, 1);
+            return float4(i == 2 ? 3 : -1, i == 1 ? -3 : 1, test_depth, 1);
         }
         [RootSignature(RS)] float copy_depth(float4 p : SV_Position) : SV_Depth {
             return input_depth.Load(int3(int2(p.xy), 0));
         }
-        [RootSignature(RS)] float4 color() : SV_Target { return float4(1, 0, 0, 1); }
+        [RootSignature(RS)] float4 color() : SV_Target {
+            return test_depth < 0.5 ? float4(0, 0, 1, 1) : float4(1, 0, 0, 1);
+        }
     "#;
     let vs = tests::compile(SOURCE, s!("vs"), s!("vs_5_1"));
     let copy = tests::compile(SOURCE, s!("copy_depth"), s!("ps_5_1"));
@@ -145,7 +155,7 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
         let copy_pso: ID3D12PipelineState = host.device.CreateGraphicsPipelineState(&desc).unwrap();
         desc.PS = code(&color);
         desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
         desc.DepthStencilState.StencilEnable = true.into();
         desc.DepthStencilState.StencilReadMask = 0xff;
         desc.NumRenderTargets = 1;
@@ -167,7 +177,7 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
             .device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 2,
+                NumDescriptors: 3,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -186,10 +196,42 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
             .CreateUnorderedAccessView(&mirror, None::<&ID3D12Resource>, None, uav_cpu);
         let mut uav_gpu = heap.GetGPUDescriptorHandleForHeapStart();
         uav_gpu.ptr += u64::from(increment);
+        let mut depth_cpu = uav_cpu;
+        depth_cpu.ptr += increment as usize;
+        host.device.CreateShaderResourceView(
+            &depth,
+            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MipLevels: 1,
+                        ..Default::default()
+                    },
+                },
+            }),
+            depth_cpu,
+        );
+        let mut depth_gpu = uav_gpu;
+        depth_gpu.ptr += u64::from(increment);
         let l = &list.list;
+        l.ClearDepthStencilView(
+            dsv,
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+            0.25,
+            7,
+            None,
+        );
+        l.ResourceBarrier(&[transition(
+            &depth,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        )]);
         l.SetDescriptorHeaps(&[Some(heap.clone())]);
         l.SetComputeRootSignature(&write_root);
         l.SetComputeRootDescriptorTable(0, uav_gpu);
+        l.SetComputeRootDescriptorTable(1, depth_gpu);
         l.SetPipelineState(&write_pso);
         l.Dispatch(1, 1, 1);
         l.ResourceBarrier(&[transition(
@@ -197,16 +239,15 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )]);
-        l.ClearDepthStencilView(
-            dsv,
-            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-            0.0,
-            7,
-            None,
-        );
+        l.ResourceBarrier(&[transition(
+            &depth,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        )]);
         l.ClearRenderTargetView(rtv, &[0.0; 4], None);
         l.SetGraphicsRootSignature(&root);
         l.SetGraphicsRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+        l.SetGraphicsRoot32BitConstant(1, 0.5f32.to_bits(), 0);
         l.RSSetViewports(&[D3D12_VIEWPORT {
             Width: 4.0,
             Height: 4.0,
@@ -227,6 +268,9 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
         l.SetPipelineState(&color_pso);
         l.OMSetStencilRef(7);
         l.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+        l.SetGraphicsRoot32BitConstant(1, 0.25f32.to_bits(), 0);
+        l.DrawInstanced(3, 1, 0, 0);
+        l.SetGraphicsRoot32BitConstant(1, 0.75f32.to_bits(), 0);
         l.DrawInstanced(3, 1, 0, 0);
         l.ResourceBarrier(&[transition(
             &target,
@@ -244,7 +288,9 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
                 .add(y * footprint.Footprint.RowPitch as usize);
             assert_eq!(
                 std::slice::from_raw_parts(row, 16),
-                &[0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255]
+                &[
+                    0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255, 255, 0, 0, 255
+                ]
             );
         }
         readback.Unmap(0, None);
