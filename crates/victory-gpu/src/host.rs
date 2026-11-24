@@ -1180,6 +1180,14 @@ struct Readback {
     row_bytes: usize,
 }
 
+impl Readback {
+    fn title_range(&self) -> TitleRange {
+        let size = self.dst_pitch.saturating_mul(self.lines.saturating_sub(1));
+        let end = self.dst.saturating_add(size).saturating_add(self.row_bytes);
+        (self.dst, end)
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload/readback buffers its GPU commands name, kept until the list
@@ -1424,9 +1432,7 @@ impl Host {
         let mut batch: Vec<usize> = Vec::with_capacity(runs.len());
         let mut woken = crate::fence::Woken::default();
         let mut batcher = Batch::default();
-        // Title ranges the submission's shaders write so far: title memory
-        // there is older than the lists' host copies until it is copied
-        // back.
+        // Title ranges still awaiting GPU copy-back or completion writes.
         let mut writing: Vec<TitleRange> = Vec::new();
         // Where the last submission ended (the time between it and the
         // next one is preparing, `SUBMISSION_US[0]`).
@@ -1435,12 +1441,8 @@ impl Host {
             let (copies, own_writes, self_overlap) = list.copy_plan();
             if !batch.is_empty() && copies.iter().any(|&(at, len)| overlaps_write(&writing, at, len))
             {
-                // In title order this list's copy reads after the earlier
-                // lists' shaders wrote: only once those lists ran and the
-                // writes went back does title memory hold what it would
-                // read. Run the lists prepared so far and copy their
-                // writes back before preparing this one; lists whose
-                // copies read elsewhere keep batching in one submission.
+                // Complete the earlier lists' writes before reading them.
+                // Copies from unrelated ranges can still share a batch.
                 batcher.title_written();
                 #[cfg(feature = "diagnostics")]
                 tracing::debug!(
@@ -1448,7 +1450,7 @@ impl Host {
                     next_fence = *submitted + 1,
                     index,
                     writes = ?writing,
-                    "the submission splits: a copy reads a range an earlier list's shaders write"
+                    "the submission splits: a copy reads a range an earlier list writes"
                 );
                 self.run_batch(
                     runs,
@@ -1645,8 +1647,8 @@ impl Host {
         // bytes the GPU copied. Per destination row: only the copied
         // columns are written, so the rest of each row and the gaps
         // between slices keep the title's pixels.
-        for list in runs {
-            for rb in &list.deferred().readbacks {
+        for &r in batch {
+            for rb in &runs[r].deferred().readbacks {
                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
                     // Packed rows: one contiguous range.
                     let bytes = rb.row_bytes.saturating_mul(rb.lines);
@@ -2235,6 +2237,13 @@ impl HostList {
                 _ => {}
             }
         }
+        writes.extend(deferred.readbacks.iter().map(Readback::title_range));
+        writes.extend(
+            deferred
+                .writes
+                .iter()
+                .map(|&(at, _, bytes)| (at, at.saturating_add(bytes))),
+        );
         (sources, writes, self_overlap)
     }
 

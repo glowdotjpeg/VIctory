@@ -2246,8 +2246,29 @@ mod tests {
         slot::<ClearRtv>(list, 0x1a0)(list, handle, &clear_color, 0, null.cast());
         let target_result = read_back(target);
 
+        // A CPU-emulated buffer copy on the following list must see the
+        // readback even when both lists are submitted in one call.
+        let mut consumer = null;
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut consumer),
+            S_OK
+        );
+        let consumer_result = committed(&buffer(256));
+        type CopyBuffer = extern "system" fn(This, This, u64, This, u64, u64);
+        slot::<CopyBuffer>(consumer, 0x78)(consumer, consumer_result, 0, target_result, 0, 16);
+
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(consumer, 0x48)(consumer), S_OK);
+        let runs = [list, consumer];
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 2, runs.as_ptr());
+        let (actual, _) = buffer_bytes(consumer_result).unwrap();
+        assert_eq!(
+            // SAFETY: the consumer's 16 copied bytes are mapped and complete.
+            unsafe { std::slice::from_raw_parts(actual, 16) },
+            [255, 0, 255, 255].repeat(4)
+        );
+        assert_eq!(slot::<Release>(consumer_result, 0x10)(consumer_result), 0);
+        assert_eq!(slot::<Release>(consumer, 0x10)(consumer), 0);
 
         // The GPU has finished: verify what landed in title memory.
         // 256-aligned readback at offset 256 (leading 256 bytes untouched).
