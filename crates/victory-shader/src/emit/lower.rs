@@ -1862,8 +1862,8 @@ impl<'a> Lower<'a> {
     /// Mesh: the counts and the primitives no lane exports. The console's
     /// counts come from one lane's allocation request, which DXIL cannot
     /// express (one call, dominating every output write).
-    // shortcut: the counts are the declared maxima and each lane first culls
-    // its primitive (all indices 0, zero area), so primitives past the
+    // shortcut: the counts are the declared maxima and the lanes first cull
+    // all primitives (all indices 0, zero area), so primitives past the
     // program's count are culled and vertices past it unused; this costs
     // the host the unused vertex and primitive slots. Pass the program's own
     // counts if that shows in frame time.
@@ -1872,7 +1872,10 @@ impl<'a> Lower<'a> {
         if mesh.topology != 2 {
             return Err("a mesh shader not drawing triangles");
         }
-        if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
+        if !(1..=128).contains(&threads)
+            || !(1..=256).contains(&mesh.max_vertices)
+            || !(1..=256).contains(&mesh.max_primitives)
+        {
             return Err("a mesh shader beyond the host's limits");
         }
         let e = self.s.entry;
@@ -1884,18 +1887,27 @@ impl<'a> Lower<'a> {
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
         let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
-        let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
-        self.end_guarded(at, &[]);
+        for base in (0..mesh.max_primitives).step_by(threads as usize) {
+            let index = if base == 0 {
+                flat
+            } else {
+                let offset = self.s.m.i32(base);
+                self.s.m.bin(self.cur, Bin::Add, flat, offset)
+            };
+            let guard = (base + threads > mesh.max_primitives)
+                .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
+            let at = self.begin_guarded(guard);
+            self.s.op(
+                self.cur,
+                "emitIndices",
+                Attr::NoUnwind,
+                void,
+                169,
+                &[index, z, z, z],
+            );
+            self.end_guarded(at, &[]);
+        }
         Ok(())
     }
 
@@ -6255,8 +6267,15 @@ impl<'a> Lower<'a> {
         {
             return Err("a 16-bit output the stage data does not mark");
         }
-        // A mesh lane writes its own vertex or primitive, where it exports.
+        // Mesh output is indexed by thread, which can exceed the output count.
         let at = if mesh {
+            let mesh = self.s.mesh.expect("mesh");
+            let limit = if primitive {
+                mesh.max_primitives
+            } else {
+                mesh.max_vertices
+            };
+            let guard = self.mesh_output_guard(limit, guard);
             self.begin_guarded(guard)
         } else {
             None
@@ -6317,22 +6336,42 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    fn mesh_output_guard(&mut self, limit: u32, active: Option<V>) -> Option<V> {
+        if self.s.threads.expect("mesh")[0] <= limit {
+            return active;
+        }
+        let thread = self.mesh_thread();
+        let limit = self.s.m.i32(limit);
+        let in_bounds = self.s.m.cmp(self.cur, pred::IULT, thread, limit);
+        Some(match active {
+            Some(active) => self.s.m.bin(self.cur, Bin::And, active, in_bounds),
+            None => in_bounds,
+        })
+    }
+
+    /// Mesh: `exp prim` as the lane's primitive. Convert a culled triangle
+    /// or an invalid vertex reference into a degenerate triangle.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let mesh = self.s.mesh.expect("mesh");
+        let guard = self.mesh_output_guard(mesh.max_primitives, guard);
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
-        for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
-            let i = self.s.m.bin(c, Bin::LShr, x, shift);
-            let i = self.s.m.bin(c, Bin::And, i, mask);
-            args.push(self.s.m.select(c, culled, z, i));
+        let limit = self.s.m.i32(mesh.max_vertices);
+        let mask = self.s.m.i32(0x3ff);
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut indices = [z; 3];
+        for (k, index) in indices.iter_mut().enumerate() {
+            let shift = self.s.m.i32(10 * k as u32);
+            let shifted = self.s.m.bin(c, Bin::LShr, x, shift);
+            *index = self.s.m.bin(c, Bin::And, shifted, mask);
+            let invalid = self.s.m.cmp(c, pred::IUGE, *index, limit);
+            culled = self.s.m.bin(c, Bin::Or, culled, invalid);
         }
+        let [a, b, d] = indices.map(|i| self.s.m.select(c, culled, z, i));
+        let args = [self.mesh_thread(), a, b, d];
         let void = self.s.t.void;
         self.s
             .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
@@ -6560,7 +6599,8 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::emit::container::SigElement;
+    use crate::native::{ComputeIo, HwStage, MeshIo, NativeProgram, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6627,6 +6667,71 @@ mod tests {
         ];
         for words in [add, sub] {
             lowers(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn mesh_outputs_validate_with_different_thread_and_primitive_counts() {
+        let words: [u32; 7] = [
+            0x7E12_0280, // v_mov_b32 v9, 0
+            0x7E14_02F2, // v_mov_b32 v10, 1.0
+            0xF800_00CF, 0x0A09_0909, // exp pos0, v9, v9, v9, v10
+            0xF800_0941, 0x0000_0009, // exp prim, v9, off, off, off done
+            S_ENDPGM,
+        ];
+        for max_primitives in [1, 65] {
+            let native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64: false,
+                vgprs: 16,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 32,
+                    max_vertices: 3,
+                    max_primitives,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let lowered = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![SigElement {
+                    name: "SV_Position".into(),
+                    index: 0,
+                    kind: 3,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 0,
+                    half: false,
+                }],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+            assert!(lowered.dxil.starts_with(b"DXBC"));
+            #[cfg(windows)]
+            if let Ok(mut validator) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                let mut dxil = lowered.dxil;
+                validator.validate(&mut dxil).unwrap();
+            }
         }
     }
 
