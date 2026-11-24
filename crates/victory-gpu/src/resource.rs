@@ -1761,7 +1761,7 @@ mod tests {
             );
         }
         back.close();
-        host.execute(&[&back]);
+        host.execute(&[&back], "texture readback test");
         let mut mapped = std::ptr::null_mut();
         // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
         let read = unsafe {

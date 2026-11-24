@@ -270,7 +270,7 @@ fn dump_one(
         read
     };
     list.close();
-    host.execute(&[&list]);
+    host.execute(&[&list], "diagnostic render-target readback");
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();

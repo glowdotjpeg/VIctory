@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -488,7 +488,7 @@ impl Host {
     }
 
     /// Runs closed lists and waits for them.
-    pub(crate) fn execute(&self, runs: &[&HostList]) {
+    pub(crate) fn execute(&self, runs: &[&HostList], operation: &str) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -528,15 +528,30 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                if let Err(error) = self.queue.Signal(&self.fence, *submitted) {
+                    self.submission_failed(
+                        operation,
+                        runs,
+                        format_args!("signal host fence: {error}"),
+                    );
+                }
+                if let Err(error) = self.fence.SetEventOnCompletion(*submitted, self.event) {
+                    self.submission_failed(
+                        operation,
+                        runs,
+                        format_args!("register host fence event: {error}"),
+                    );
+                }
+                let waited = WaitForSingleObject(self.event, INFINITE);
+                if waited != WAIT_OBJECT_0 {
+                    self.submission_failed(
+                        operation,
+                        runs,
+                        format_args!("host fence wait returned {:#x}", waited.0),
+                    );
+                }
+                if self.device.GetDeviceRemovedReason().is_err() {
+                    self.submission_failed(operation, runs, format_args!("device removed"));
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -562,15 +577,6 @@ impl Host {
                 .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
-        }
-        // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs)
-            ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -602,6 +608,20 @@ impl Host {
             }
         }
         self.log_messages();
+    }
+
+    fn submission_failed(
+        &self,
+        operation: &str,
+        runs: &[&HostList],
+        reason: std::fmt::Arguments<'_>,
+    ) -> ! {
+        fail(format_args!(
+            "host GPU {operation} submission failed ({reason}, {} lists){}{}",
+            runs.len(),
+            self.removal_data(runs),
+            last_notes(runs)
+        ));
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1645,12 +1665,18 @@ impl Host {
                 ),
             ]);
             p.copy.close();
-            self.execute(&[&p.copy]);
+            self.execute(&[&p.copy], "presentation copy");
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if let Err(error) = p.swap_chain.Present(0, DXGI_PRESENT(0)).ok() {
+                if self.device.GetDeviceRemovedReason().is_err() {
+                    fail(format_args!("host GPU swap-chain present failed: {error}"));
+                }
+                tracing::warn!(%error, "host swap-chain present failed");
+                return None;
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
