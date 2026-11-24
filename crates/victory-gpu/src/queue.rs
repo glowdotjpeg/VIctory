@@ -163,9 +163,28 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     }
     crate::fence::signal(fence, value)
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+/// Shortcut: queue waits for future work are not implemented.
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        static UNSATISFIED: AtomicU64 = AtomicU64::new(0);
+        let completed = crate::fence::completed(fence);
+        if completed < value {
+            let count = UNSATISFIED.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                tracing::warn!(
+                    queue = ?this, fence = ?fence, requested = value, completed, count,
+                    "title queue wait would have waited for a future signal"
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (this, value);
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
