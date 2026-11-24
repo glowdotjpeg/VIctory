@@ -3308,6 +3308,26 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The handle properties shared by scalar buffer loads and their
+    /// descriptor size queries.
+    fn scalar_buffer_props(used: &UsedResource) -> Result<(u32, u32), Why> {
+        let flags = match used.kind {
+            ResourceType::Srv => 0,
+            ResourceType::Uav => 0x1000,
+            ResourceType::Cbv => return Err("a constant buffer's descriptor read as data"),
+            _ => return Err("a scalar buffer's descriptor of unknown kind"),
+        };
+        if used.dwords != 4 {
+            return Err("a scalar buffer's descriptor of unknown kind");
+        }
+        match used.stride {
+            // The title's byte-address buffers also report a byte stride.
+            0 | 1 => Ok((11 | flags, 0)),
+            stride if stride.is_multiple_of(4) => Ok((12 | flags, stride)),
+            _ => Err("a scalar buffer's descriptor of unsupported stride"),
+        }
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -3363,20 +3383,32 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if let Some(used) = kind
+            && matches!(used.kind, ResourceType::Srv | ResourceType::Uav)
+        {
+            let props = Self::scalar_buffer_props(used)?;
+            let h = self.handle(site, src, false, props)?;
+            let stride = (props.1 != 0).then(|| self.s.m.i32(props.1));
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let (index, offset) = if let Some(stride) = stride {
+                    (
+                        self.s.m.bin(c, Bin::UDiv, a, stride),
+                        self.s.m.bin(c, Bin::URem, a, stride),
+                    )
+                } else {
+                    (a, self.s.m.undef(self.s.t.i32))
+                };
                 let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let al = self.s.m.i32(4);
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, index, offset, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
@@ -3507,6 +3539,10 @@ impl<'a> Lower<'a> {
                     return Err("a constant buffer's descriptor read as data");
                 }
                 (props, None)
+            }
+            Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
+                let used = used.ok_or("a scalar buffer's descriptor of unknown kind")?;
+                (Self::scalar_buffer_props(used)?, None)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -7743,6 +7779,16 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_compute(words, layout, used, wave64, 1 << 15)
+    }
+
+    fn lower_compute(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        lds_rsrc2: u32,
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -7752,8 +7798,7 @@ mod tests {
             layout,
             used,
             io: StageIo::Cs(ComputeIo {
-                // The layout's user SGPRs (at least two), 512 bytes of LDS.
-                rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                rsrc2: lds_rsrc2 | sgprs.max(2) << 1,
                 threads: [1, 1, 1],
             }),
             code,
@@ -8001,6 +8046,104 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn scalar_structured_buffer_reads_its_data_and_record_count() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0404,
+            0xFA00_0014, // s_buffer_load_dword s16, s[8:11], 20
+            0xF408_0502,
+            0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 32
+            0x7E02_0210, // v_mov_b32 v1, s16
+            0x7E04_020A, // v_mov_b32 v2, s10
+            0xE070_0000,
+            0x8005_0100, // buffer_store_dword v1, off, s[20:23], 0
+            0xE070_0004,
+            0x8005_0200, // buffer_store_dword v2, off, s[20:23], 0 offset:4
+            S_ENDPGM,
+        ];
+        let input = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 16,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let lowered = lower_compute(
+            &words,
+            vec![root(RootType::Table, 0, 0)],
+            vec![
+                input,
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    table_offset_dwords: 8,
+                    stride: 0,
+                    ..input
+                },
+            ],
+            false,
+            0,
+        )
+        .unwrap();
+        assert!(lowered.dxil.starts_with(b"DXBC"));
+        #[cfg(windows)]
+        {
+            use super::super::host::{Dispatch, Host, Root, Stride, View};
+            use super::super::{HostShader, validator};
+            if let Ok(mut validator) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                validator.validate(&mut lowered.dxil.clone()).unwrap();
+            }
+            let _one = super::super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Ok(host) = Host::new(true) else {
+                eprintln!("no SM 6.6 WARP device; skipped");
+                return;
+            };
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil: lowered.dxil,
+                user_data: lowered.user_data,
+                samplers: lowered.samplers,
+                static_samplers: vec![],
+                root_cbvs: lowered.root_cbvs,
+                root_srvs: lowered.root_srvs,
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let data = [1, 2, 3, 4, 5, 0xace1, 7, 8, 9, 10, 11, 12];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                        )],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Structured(16),
+                            },
+                            View::RawUav(2),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out[0], [0xace1, 3]);
+        }
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
