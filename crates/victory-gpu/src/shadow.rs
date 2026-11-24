@@ -187,7 +187,12 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn copy_back(
+        &self,
+        address: usize,
+        len: usize,
+        woken: &mut crate::fence::Woken,
+    ) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -224,7 +229,9 @@ impl Shadow {
                     }
                     if changed {
                         crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        woken.add(crate::fence::write_and_collect(start + at, n, || {
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        }));
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
@@ -496,4 +503,47 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod memory_wait_tests {
+    use super::*;
+    use crate::fence::{MemoryWait, Operand, Predicate, Woken};
+    use crate::timeline::{Op, Timeline};
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn copy_back_keeps_a_transient_match_until_after_submission() {
+        let (buffer, data) = host()
+            .expect("D3D12")
+            .shared_buffer(8)
+            .expect("test buffer");
+        let title = AtomicU64::new(0);
+        let at = title.as_ptr() as usize;
+        let shadow = Shadow::new(buffer, data, 0, at as u64, 8);
+        let queue = Arc::new(Timeline::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        queue.submit_batch([
+            Op::Memory(MemoryWait::new(Predicate {
+                address: at,
+                operand: Operand::Qword,
+                comparison: 3,
+                reference: 1,
+            })),
+            Op::Run(Box::new(move || tx.send(()).unwrap())),
+        ]);
+        let mut woken = Woken::default();
+        // SAFETY: this test exclusively owns the mapped host buffer.
+        unsafe { data.cast::<u64>().write(0) };
+        for value in [1, 2] {
+            shadow.writing(at, 8);
+            // SAFETY: simulate the completed shader store into our host buffer.
+            unsafe { data.cast::<u64>().write(value) };
+            assert_eq!(shadow.copy_back(at, 8, &mut woken), 8);
+        }
+        assert_eq!(title.load(Ordering::Acquire), 2);
+        assert!(rx.try_recv().is_err());
+        woken.run();
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    }
 }

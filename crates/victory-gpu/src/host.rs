@@ -38,6 +38,8 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+/// Maximum number of detached host lists kept for reuse after pending resets.
+const LIST_POOL_CAP: usize = 64;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -57,6 +59,10 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Detached host lists whose submissions finished, ready to reuse.
+    free_lists: Mutex<Vec<HostList>>,
+    #[cfg(test)]
+    reused_lists: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -226,6 +232,9 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            free_lists: Mutex::default(),
+            #[cfg(test)]
+            reused_lists: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -652,6 +661,13 @@ pub(crate) struct HostList {
     buffers: Mutex<BufferStates<ID3D12Resource>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// Memory handed out for the list's recording, kept until it is finished
+    /// when the title reset or dropped the list while a submission of it was
+    /// still to run.
+    kept_uploads: Mutex<Vec<Vec<u8>>>,
+    /// Dynamic descriptor slots kept alongside `kept_uploads` until the pending
+    /// submission completes.
+    kept_dynamic: Mutex<Vec<(Arc<crate::descriptor::host::HostHeap>, u32, u32)>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -666,6 +682,20 @@ pub(crate) struct HostList {
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
+
+impl Drop for HostList {
+    fn drop(&mut self) {
+        self.release_kept();
+    }
+}
+
+// SAFETY: D3D12 lists and allocators may be used from any thread, one at
+// a time: the title records a list on one thread at a time, and a
+// submission runs it after its recording ended (a reset while one is to
+// run moves recording to a new list). The rest is locked.
+unsafe impl Send for HostList {}
+// SAFETY: as above.
+unsafe impl Sync for HostList {}
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -794,7 +824,7 @@ enum Step {
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    Run(usize, usize, Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
@@ -866,6 +896,39 @@ impl Host {
         })
     }
 
+    /// A recycled host list (reset and open), or a new one when the pool is
+    /// empty.
+    pub(crate) fn acquire_list(&self) -> windows::core::Result<HostList> {
+        let pooled = self
+            .free_lists
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop();
+        if let Some(list) = pooled {
+            #[cfg(test)]
+            self.reused_lists.fetch_add(1, Ordering::Relaxed);
+            list.reset();
+            return Ok(list);
+        }
+        self.new_list()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reused_lists(&self) -> u64 {
+        self.reused_lists.load(Ordering::Relaxed)
+    }
+
+    /// Returns a finished, unreferenced host list to the pool up to
+    /// [`LIST_POOL_CAP`], releasing any kept upload blocks and dynamic slots
+    /// immediately.
+    pub(crate) fn recycle_list(&self, list: HostList) {
+        list.release_kept();
+        let mut pool = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < LIST_POOL_CAP {
+            pool.push(list);
+        }
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -897,6 +960,8 @@ impl Host {
                 states: Mutex::default(),
                 buffers: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
+                kept_uploads: Mutex::default(),
+                kept_dynamic: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
@@ -911,8 +976,11 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList], operation: &str) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        self.execute_locked(runs, &mut submitted, operation);
+        let woken = {
+            let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            self.execute_locked(runs, &mut submitted, operation)
+        };
+        woken.run();
     }
 
     /// Records and executes a standalone host read, restoring the source's states.
@@ -946,11 +1014,18 @@ impl Host {
         let result = record(&list.list);
         transition(true);
         list.close();
-        self.execute_locked(&[list], &mut submitted, operation);
+        let woken = self.execute_locked(&[list], &mut submitted, operation);
+        drop(submitted);
+        woken.run();
         result
     }
 
-    fn execute_locked(&self, runs: &[&HostList], submitted: &mut u64, operation: &str) {
+    fn execute_locked(
+        &self,
+        runs: &[&HostList],
+        submitted: &mut u64,
+        operation: &str,
+    ) -> crate::fence::Woken {
         // SAFETY: a status query on our device.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             self.submission_failed(
@@ -989,8 +1064,9 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let mut woken = crate::fence::Woken::default();
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, &mut woken);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -1100,16 +1176,19 @@ impl Host {
         }
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+            let written = shadow.copy_back(address, len, &mut woken);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Queues these writes release run their work once no lock is held:
+        // it submits lists itself (this lock, the lists' `deferred`).
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
-                what.write(at as *mut u8, bytes);
+                woken.add(what.write(at as *mut u8, bytes));
             }
         }
         self.log_messages();
+        woken
     }
 
     fn submission_failed(
@@ -1303,6 +1382,44 @@ impl Host {
 }
 
 impl HostList {
+    /// Keeps `blocks` (memory handed out for the recording) until the list
+    /// finishes executing and is recycled or dropped.
+    pub(crate) fn keep_uploads(&self, blocks: Vec<Vec<u8>>) {
+        if !blocks.is_empty() {
+            self.kept_uploads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(blocks);
+        }
+    }
+
+    /// Keeps dynamic descriptor slots alive until this host list finishes
+    /// executing and is recycled or dropped.
+    pub(crate) fn keep_dynamic(
+        &self,
+        slots: Vec<(Arc<crate::descriptor::host::HostHeap>, u32, u32)>,
+    ) {
+        if !slots.is_empty() {
+            self.kept_dynamic
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(slots);
+        }
+    }
+
+    /// Frees kept upload blocks and returns kept dynamic descriptor slots.
+    fn release_kept(&self) {
+        self.kept_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let dynamic =
+            std::mem::take(&mut *self.kept_dynamic.lock().unwrap_or_else(|e| e.into_inner()));
+        for (heap, first, n) in dynamic {
+            heap.release(first, n);
+        }
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -1419,6 +1536,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.release_kept();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1705,8 +1823,10 @@ impl HostList {
 
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
+    pub(crate) fn defer(&self, dst: usize, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred()
+            .copies
+            .push(Step::Run(dst, len, Box::new(work)));
         self.deferred().refreshed.clear();
     }
 
@@ -1724,7 +1844,7 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, woken: &mut crate::fence::Woken) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -1737,7 +1857,9 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    woken.add(crate::fence::write_and_collect(dst, len, || {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }));
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -1758,11 +1880,13 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
+                Step::Run(_, _, work) | Step::Host(work) => {
+                    if let Step::Run(dst, len, _) = step {
                         batch.title_written();
+                        woken.add(crate::fence::write_and_collect(*dst, *len, work));
+                    } else {
+                        work();
                     }
-                    work();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -1912,7 +2036,10 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
+            && done == len
+    }
 }
 
 /// Copies host memory into title memory after a submission (what shaders

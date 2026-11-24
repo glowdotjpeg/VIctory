@@ -62,10 +62,14 @@ pub(crate) struct State {
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
-    targets: Vec<usize>,
-    depth: usize,
+    targets: Vec<(usize, Option<D3D12_RENDER_TARGET_VIEW_DESC>)>,
+    depth: Option<(usize, Option<D3D12_DEPTH_STENCIL_VIEW_DESC>)>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend: Option<[f32; 4]>,
+    stencil: u32,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -171,6 +175,63 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Takes the dynamic descriptor slots held by this recording, so a
+    /// pending host list can keep them alive until its submission finishes.
+    pub(crate) fn take_dynamic(
+        &mut self,
+    ) -> Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, u32, u32)> {
+        std::mem::take(&mut self.dynamic)
+    }
+
+    pub(crate) fn resume_on(&mut self, list: &HostList) {
+        // The guest state spans the wait. A fresh native list has no bindings,
+        // and descriptor leases before the split belong to the closed prefix.
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.fresh_tables.clear();
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+        if !self.viewports.is_empty() {
+            viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            scissors(list, &self.scissors);
+        }
+        if self.blend.is_some() {
+            blend_factor(list, self.blend.as_ref());
+        }
+        if self.stencil != 0 {
+            stencil_ref(list, self.stencil);
+        }
+        if !self.targets.is_empty() || self.depth.is_some() {
+            self.bind_targets(list);
+        }
+    }
+
+    pub(crate) fn set_viewports(&mut self, list: &HostList, values: &[D3D12_VIEWPORT]) {
+        self.viewports.clear();
+        self.viewports.extend_from_slice(values);
+        viewports(list, values);
+    }
+
+    pub(crate) fn set_scissors(&mut self, list: &HostList, values: &[RECT]) {
+        self.scissors.clear();
+        self.scissors.extend_from_slice(values);
+        scissors(list, values);
+    }
+
+    pub(crate) fn set_blend(&mut self, list: &HostList, value: Option<&[f32; 4]>) {
+        self.blend = value.copied();
+        blend_factor(list, value);
+    }
+
+    pub(crate) fn set_stencil(&mut self, list: &HostList, value: u32) {
+        self.stencil = value;
+        stencil_ref(list, value);
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -255,11 +316,7 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
         self.targets.clear();
-        let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -268,21 +325,38 @@ impl State {
                 );
                 continue;
             };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
-                continue;
-            };
-            self.targets.push(record.resource as usize);
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            if crate::resource::host_resource(record.resource).is_some() {
+                self.targets.push((record.resource as usize, record.desc()));
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(record.resource);
+            }
         }
-        self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
-            self.depth = record.resource as usize;
+        self.depth = crate::descriptor::dsv_record(depth).and_then(|record| {
+            crate::resource::host_resource(record.resource)?;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((record.resource as usize, record.depth_desc()))
+        });
+        self.bind_targets(list);
+    }
+
+    fn bind_targets(&self, list: &HostList) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // The host's CPU descriptor slots are a ring. Recreate the views from
+        // their recorded descriptions instead of retaining handles across a wait.
+        let rtvs: Vec<_> = self
+            .targets
+            .iter()
+            .filter_map(|(address, desc)| {
+                let texture = crate::resource::host_resource(*address as This)?;
+                Some(host.rtv(texture, desc.as_ref()))
+            })
+            .collect();
+        let dsv = self.depth.as_ref().and_then(|(address, desc)| {
+            let texture = crate::resource::host_resource(*address as This)?;
+            Some(host.dsv(texture, desc.as_ref()))
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -401,11 +475,11 @@ impl State {
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
-        for &t in &self.targets {
+        for &(t, _) in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
-        if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+        if let Some((depth, _)) = self.depth {
+            crate::list::ensure_state(list, depth as This, DEPTH_WRITE);
         }
         true
     }
@@ -813,7 +887,7 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
+            .filter_map(|&(t, _)| crate::resource::host_resource(t as This))
             .map(|t| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
