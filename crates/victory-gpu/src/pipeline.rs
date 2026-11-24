@@ -104,14 +104,33 @@ pub(crate) struct Translated {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn selected_for_diagnostics(hash: &str) -> bool {
     static SELECTED: OnceLock<Option<String>> = OnceLock::new();
-    SELECTED
-        .get_or_init(|| std::env::var("VICTORY_DUMP_SHADER_MATCH").ok())
-        .as_deref()
-        .is_some_and(|selected| {
-            selected
-                .split(',')
-                .any(|candidate| candidate.trim().eq_ignore_ascii_case(hash))
-        })
+    diagnostic_match(
+        SELECTED
+            .get_or_init(|| std::env::var("VICTORY_DUMP_SHADER_MATCH").ok())
+            .as_deref(),
+        hash,
+    )
+}
+
+/// Warms shaders that a capture depends on without capturing their draws.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn prewarm_for_diagnostics(hash: &str) -> bool {
+    static PREWARM: OnceLock<Option<String>> = OnceLock::new();
+    diagnostic_match(
+        PREWARM
+            .get_or_init(|| std::env::var("VICTORY_PREWARM_SHADER_MATCH").ok())
+            .as_deref(),
+        hash,
+    ) || selected_for_diagnostics(hash)
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn diagnostic_match(selected: Option<&str>, hash: &str) -> bool {
+    selected.is_some_and(|selected| {
+        selected
+            .split(',')
+            .any(|candidate| candidate.trim().eq_ignore_ascii_case(hash))
+    })
 }
 
 #[cfg(windows)]

@@ -175,7 +175,7 @@ pub(crate) fn early(p: &Arc<Pending>) {
     #[cfg(feature = "diagnostics")]
     if p.shaders
         .iter()
-        .any(|shader| crate::pipeline::selected_for_diagnostics(&shader.hash))
+        .any(|shader| crate::pipeline::prewarm_for_diagnostics(&shader.hash))
     {
         start(p, true);
         return;
