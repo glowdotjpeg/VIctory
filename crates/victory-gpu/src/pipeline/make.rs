@@ -172,6 +172,14 @@ fn start(p: &Arc<Pending>, demand: bool) {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    #[cfg(feature = "diagnostics")]
+    if p.shaders
+        .iter()
+        .any(|shader| crate::pipeline::selected_for_diagnostics(&shader.hash))
+    {
+        start(p, true);
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, false);
