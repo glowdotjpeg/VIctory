@@ -4,6 +4,7 @@
 //! size. Only in builds with diagnostics.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -27,6 +28,36 @@ pub(crate) fn listed(n: u64) -> bool {
             .collect()
     })
     .contains(&n)
+        || (n != 0 && n == NEXT_BUSY.load(Relaxed))
+}
+
+static NEXT_BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_CAPTURE_BUSY=<draws>[,<count>]` selects frames after unusually
+/// busy frames, up to `count` times (default two). World loading can reach
+/// those frames at different frame numbers across runs.
+pub(crate) fn note_busy(frame: u64) {
+    static SETTING: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    static LAST_WORK: AtomicU64 = AtomicU64::new(0);
+    static SCHEDULED: AtomicU64 = AtomicU64::new(0);
+    let Some((threshold, limit)) = *SETTING.get_or_init(|| {
+        folder()?;
+        let value = std::env::var("VICTORY_CAPTURE_BUSY").ok()?;
+        let (draws, count) = value.split_once(',').unwrap_or((&value, "2"));
+        Some((draws.trim().parse().ok()?, count.trim().parse().ok()?))
+    }) else {
+        return;
+    };
+    let now = crate::draw::drawn() + crate::draw::dispatched();
+    let work = now.saturating_sub(LAST_WORK.swap(now, Relaxed));
+    if work > threshold
+        && SCHEDULED.load(Relaxed) < limit
+        && frame >= NEXT_BUSY.load(Relaxed).saturating_add(8)
+    {
+        NEXT_BUSY.store(frame + 1, Relaxed);
+        SCHEDULED.fetch_add(1, Relaxed);
+        tracing::info!(frame = frame + 1, work, "capturing after a busy frame");
+    }
 }
 
 /// Whether frame `n` is saved.
