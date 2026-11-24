@@ -751,10 +751,10 @@ impl State {
 
     #[cfg(feature = "diagnostics")]
     fn probe_dispatch_writes(&self, list: &HostList, pipeline: &HostPipeline) {
-        let frame = crate::queue::presented() + 1;
-        if !crate::capture::listed(frame) {
+        if crate::capture::folder().is_none() {
             return;
         }
+        let frame = crate::queue::presented() + 1;
         let Some(host) = crate::host::host() else {
             return;
         };

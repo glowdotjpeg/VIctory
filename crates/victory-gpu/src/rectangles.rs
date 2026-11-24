@@ -720,10 +720,10 @@ fn probe_args(
 ) {
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-    let frame = crate::queue::presented() + 1;
-    if !crate::capture::listed(frame) {
+    if crate::capture::folder().is_none() {
         return;
     }
+    let frame = crate::queue::presented() + 1;
     let Some(stage) = pipeline
         .stages
         .iter()
