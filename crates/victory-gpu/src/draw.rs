@@ -81,6 +81,8 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: host heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, u32, u32)>,
+    /// Root SRVs bound as one-view tables: (heap, host buffer, byte offset).
+    root_srv_slots: std::collections::HashMap<(usize, usize, u64), u32>,
 }
 
 impl Drop for State {
@@ -133,18 +135,13 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
-/// The host address of a root view: its buffer's host copy, or for a
-/// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
-/// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
-/// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+/// The host address of a root CBV, with an aligned upload copy when needed.
+/// A root CBV lacks a size, so copy up to 64 KiB within the title buffer.
+fn root_cbv(list: &HostList, address: u64) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+    let len = shadow.left(address).min(1 << 16);
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
@@ -598,26 +595,92 @@ impl State {
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
-                for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
-                    };
-                    let Some(gpu) = root_view(list, *address, srv) else {
-                        continue;
-                    };
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
+            for &(slot, param) in &stage.root_cbvs {
+                let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                    once!(slot, "a shader reads a root view the title did not set");
+                    continue;
+                };
+                let Some(gpu) = root_cbv(list, address) else { continue };
+                // SAFETY: an open list; the address is in live memory.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootConstantBufferView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootConstantBufferView(param, gpu);
                     }
                 }
+            }
+            for &(slot, param) in &stage.root_srvs {
+                let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                    Some(&Root::View(address)) => Some(address),
+                    _ => None,
+                };
+                if !self.root_srv_table(list, address, param, compute) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Binds a root SRV as a raw view bounded by the host copy, or a null
+    /// view if the address has no usable copy. Only one slot per view in a list.
+    /// False if no dynamic slot could be had (the draw is dropped).
+    fn root_srv_table(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        param: u32,
+        compute: bool,
+    ) -> bool {
+        let Some(host) = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This))
+            .and_then(|heap| heap.host())
+        else {
+            once!("a root SRV without a bound view heap: the draw is dropped");
+            return false;
+        };
+        let shadow = address.and_then(|address| {
+            let copy = crate::shadow::find(address, 4)?;
+            // SAFETY: a live host buffer.
+            let base = unsafe { copy.buffer.GetGPUVirtualAddress() };
+            let offset = copy.gpu(address).checked_sub(base)?;
+            if !offset.is_multiple_of(16) {
+                once!(address = format_args!("{address:#x}"), "a misaligned root SRV reads zeros");
+                return None;
+            }
+            Some((address, copy, offset))
+        });
+        let heap = std::sync::Arc::as_ptr(host) as usize;
+        let key = shadow.as_ref().map_or((heap, 0, 0), |(_, copy, offset)| {
+            (heap, copy.buffer.as_raw() as usize, *offset)
+        });
+        let index = match self.root_srv_slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let Some(index) = host.dynamic(1) else {
+                    return false;
+                };
+                self.dynamic.push((host.clone(), index, 1));
+                self.root_srv_slots.insert(key, index);
+                match &shadow {
+                    Some((address, copy, offset)) => host.raw_at(index, &copy.buffer, *offset, copy.left(*address)),
+                    None => host.null_raw_at(index),
+                }
+                index
+            }
+        };
+        if let Some((address, copy, _)) = &shadow {
+            list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
+            copy.refresh(list, *address, copy.left(*address).min(1 << 20));
+        }
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
         true
