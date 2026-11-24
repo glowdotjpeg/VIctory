@@ -48,6 +48,23 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
     ) {
         return;
     }
+    let mut debug: Option<ID3D12Debug> = None;
+    // SAFETY: this isolated process has no device yet.
+    let validation = unsafe {
+        if D3D12GetDebugInterface(&mut debug).is_ok() {
+            let debug = debug.unwrap();
+            debug.EnableDebugLayer();
+            if let Ok(gpu) = debug.cast::<ID3D12Debug1>() {
+                gpu.SetEnableGPUBasedValidation(true);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+    eprintln!("GPU-based validation enabled: {validation}");
     let host = host().expect("WARP device");
     assert!(tests::on_warp(host));
     let mirror = texture(
@@ -79,7 +96,7 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
     let rtv = host.rtv(&target, None);
 
     const SOURCE: &str = r#"
-        #define RS "DescriptorTable(SRV(t0)),RootConstants(num32BitConstants=1,b0)"
+        #define RS "DescriptorTable(SRV(t0),visibility=SHADER_VISIBILITY_PIXEL),RootConstants(num32BitConstants=1,b0)"
         Texture2D<float> input_depth : register(t0);
         RWTexture2D<float> output_depth : register(u0);
         cbuffer Params : register(b0) { float test_depth; }
@@ -294,5 +311,22 @@ fn a_float_depth_mirror_drives_d24_depth_tests_without_changing_stencil() {
             );
         }
         readback.Unmap(0, None);
+        if let Ok(messages) = host.device.cast::<ID3D12InfoQueue>() {
+            for i in 0..messages.GetNumStoredMessages() {
+                let mut size = 0;
+                messages.GetMessage(i, None, &mut size).unwrap();
+                let mut storage = vec![0u64; size.div_ceil(8)];
+                let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                messages.GetMessage(i, Some(message), &mut size).unwrap();
+                let message = &*message;
+                if message.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                    let description = std::slice::from_raw_parts(
+                        message.pDescription,
+                        message.DescriptionByteLength,
+                    );
+                    panic!("D3D12 error: {}", String::from_utf8_lossy(description));
+                }
+            }
+        }
     }
 }
