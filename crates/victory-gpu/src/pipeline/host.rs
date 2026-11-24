@@ -841,6 +841,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mixed_color_and_integer_targets_make_a_mesh_pipeline() {
+        let (Some(host), Some(dxc)) = (host(), dxc()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(
+            &dxc,
+            dir.path(),
+            "struct Out { float4 color : SV_Target0; float4 aux : SV_Target1;
+                uint mask : SV_Target2; };
+                Out main() { Out o; o.color = 1; o.aux = 0; o.mask = 7; return o; }",
+            "ps_6_5",
+        );
+        let (root, blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[..3].copy_from_slice(&[
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        let name = super::super::library::name("mesh test", &blob, &[&ms, &ps], &g.describe());
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).unwrap();
+    }
+
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
     #[test]
