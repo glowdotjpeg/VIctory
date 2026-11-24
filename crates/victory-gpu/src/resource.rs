@@ -748,31 +748,7 @@ struct Resource {
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet.
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
-}
-
-/// A title texture's host copy and the state it is in. The title's barriers
-/// name console states (looser than the host's), so we transition from this
-/// one. Lists that use the texture hold it until they are reset: the title
-/// may release a resource whose commands it recorded but not yet submitted
-/// (console memory outlives the object; a host texture must outlive the
-/// lists that name it).
-#[cfg(windows)]
-pub(crate) struct HostTexture {
-    pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    pub(crate) state: std::sync::atomic::AtomicU32,
-}
-
-/// Moves the host texture to `wanted` (a host texture state); the host
-/// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
-pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
-    use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
-    let before = host
-        .state
-        .swap(wanted, std::sync::atomic::Ordering::Relaxed);
-    (before != wanted).then(|| (host.texture.as_raw(), before))
+    host: Option<std::sync::Arc<crate::host::HostTexture>>,
 }
 
 /// The host GPU's copy of a title resource, if it has one.
@@ -788,7 +764,7 @@ pub(crate) fn host_resource<'a>(
 
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
-pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<crate::host::HostTexture>> {
     if this.is_null() {
         return None;
     }
@@ -938,10 +914,7 @@ fn hand_out_resource(
         #[cfg(windows)]
         host: host.map(|texture| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-            })
+            std::sync::Arc::new(crate::host::HostTexture::new(texture, state))
         }),
     });
     #[cfg(windows)]
@@ -1590,6 +1563,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
+        check_texture_copy(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_copy_keeps_array_slice_states_separate() {
+        check_texture_copy(true);
+    }
+
+    #[cfg(windows)]
+    fn check_texture_copy(array_copy: bool) {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -1597,15 +1581,22 @@ mod tests {
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
         let (mut image, mut source) = (null, null);
-        let rgba = texture(4, 4, 28, 1);
+        let mut rgba = texture(4, 4, 28, 1);
+        let initial = if array_copy {
+            rgba.depth_or_array_size = 3; // One slice remains untouched by the copies.
+            0
+        } else {
+            COPY_DEST
+        };
         assert_eq!(
             create_committed(
                 null,
                 &PROPERTIES,
                 0,
                 &rgba,
-                COPY_DEST,
+                initial,
                 null.cast(),
                 iid,
                 &mut image
@@ -1650,7 +1641,7 @@ mod tests {
             0x4185,
             [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
         );
-        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let (mut queue, mut allocator) = (null, null);
         let queue_desc = [0u32; 4];
         assert_eq!(
             crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
@@ -1660,16 +1651,27 @@ mod tests {
             crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
             S_OK
         );
-        assert_eq!(
-            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
-            S_OK
-        );
+        let new_list = || {
+            let mut list = null;
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+                S_OK
+            );
+            list
+        };
 
         #[repr(C)]
+        #[derive(Clone, Copy)]
         struct Location {
             resource: This,
             kind: u32,
+            data: LocationData,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        union LocationData {
             footprint: PlacedFootprint,
+            subresource: u32,
         }
         let rows = PlacedFootprint {
             offset: 0,
@@ -1682,18 +1684,79 @@ mod tests {
         let to = Location {
             resource: image,
             kind: 0,
-            footprint: PlacedFootprint { offset: 0, ..rows },
+            data: LocationData { subresource: 0 },
         };
         let from = Location {
             resource: source,
             kind: 1,
-            footprint: rows,
+            data: LocationData { footprint: rows },
         };
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
-        slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
-        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        type Close = extern "system" fn(This) -> HRESULT;
+        let upload = new_list();
+        slot::<Copy>(upload, 0x80)(upload, &to, 0, 0, 0, &from, null.cast());
+        assert_eq!(slot::<Close>(upload, 0x48)(upload), S_OK);
+
+        let copy = host_copy(image).unwrap();
+        // The upload list holds the texture until it is reset.
+        assert!(std::sync::Arc::strong_count(&copy) > 2);
+        let copied_subresource = u32::from(array_copy);
+        let copy_list = array_copy.then(|| {
+            // An explicit title barrier for slice 0, then a copy to slice 1.
+            // This list is recorded before the upload list is submitted.
+            #[repr(C)]
+            struct TransitionBarrier {
+                kind: u32,
+                flags: u32,
+                resource: This,
+                subresource: u32,
+                before: u32,
+                after: u32,
+                padding: u32,
+            }
+            let barrier = TransitionBarrier {
+                kind: 0,
+                flags: 0,
+                resource: image,
+                subresource: 0,
+                before: COPY_DEST,
+                after: COPY_SOURCE,
+                padding: 0,
+            };
+            let list = new_list();
+            type Barrier = extern "system" fn(This, u32, *const TransitionBarrier) -> u32;
+            slot::<Barrier>(list, 0xd0)(list, 1, &barrier);
+            let recorded = crate::list::host_list(list).unwrap();
+            assert_eq!(recorded.recorded_state(&copy, 0), Some(COPY_SOURCE));
+            assert_eq!(recorded.recorded_state(&copy, 1), None);
+
+            let slice_one = Location {
+                data: LocationData { subresource: copied_subresource },
+                ..to
+            };
+            let out_of_bounds = Location { data: LocationData { subresource: 3 }, ..to };
+            slot::<Copy>(list, 0x80)(list, &out_of_bounds, 0, 0, 0, &to, null.cast());
+            slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &to, null.cast());
+            assert_eq!(recorded.recorded_state(&copy, 0), Some(COPY_SOURCE));
+            assert_eq!(recorded.recorded_state(&copy, 1), None);
+            slot::<Copy>(list, 0x80)(list, &slice_one, 0, 0, 0, &to, null.cast());
+            assert_eq!(recorded.recorded_state(&copy, 0), Some(COPY_SOURCE));
+            assert_eq!(recorded.recorded_state(&copy, 1), Some(COPY_DEST));
+            assert_eq!(recorded.recorded_state(&copy, 2), None);
+            assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
+            list
+        });
+        let lists = [upload, copy_list.unwrap_or(null)];
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(
+            queue,
+            1 + u32::from(array_copy),
+            lists.as_ptr(),
+        );
+        let mixed_states = || [0, 1, 2].map(|i| copy.state(i));
+        if array_copy {
+            assert_eq!(mixed_states(), [COPY_SOURCE, COPY_DEST, 0]);
+        }
 
         // Read the host texture back into a readback buffer.
         let readback_heap = D3D12_HEAP_PROPERTIES {
@@ -1728,40 +1791,31 @@ mod tests {
                 .unwrap();
         }
         let readback = readback.unwrap();
-        let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
-        let (_, before) = host_transition(image, 0x800).unwrap();
-        // The upload list holds the texture until it is reset.
-        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
         use windows::core::Interface;
         let out_to = Location {
             resource: readback.as_raw().cast_const().cast(),
             kind: 1,
-            footprint: rows,
+            data: LocationData { footprint: rows },
         };
         let out_from = Location {
-            resource: host_image.as_raw().cast_const().cast(),
+            resource: copy.texture.as_raw().cast_const().cast(),
             kind: 0,
-            footprint: to.footprint,
+            data: LocationData { subresource: copied_subresource },
         };
-        // SAFETY: an open list, live resources, locations in the host layout.
-        unsafe {
-            back.list.ResourceBarrier(&[crate::host::transition(
-                host_image,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            back.list.CopyTextureRegion(
-                (&raw const out_to).cast(),
-                0,
-                0,
-                0,
-                (&raw const out_from).cast(),
-                None,
-            );
-        }
-        back.close();
-        host.execute(&[&back], "texture readback test");
+        host.execute_texture_read(&back, &copy, copied_subresource, "texture readback test", |list| {
+            // SAFETY: an open list, live resources, locations in the host layout.
+            unsafe {
+                list.CopyTextureRegion(
+                    (&raw const out_to).cast(),
+                    0,
+                    0,
+                    0,
+                    (&raw const out_from).cast(),
+                    None,
+                );
+            }
+        });
         let mut mapped = std::ptr::null_mut();
         // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
         let read = unsafe {
@@ -1780,6 +1834,25 @@ mod tests {
         for row in 0..4 {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
+        }
+        // SAFETY: we are done reading the mapping.
+        unsafe { readback.Unmap(0, None) };
+
+        if let Some(list) = copy_list {
+            assert_eq!(mixed_states(), [COPY_SOURCE, COPY_DEST, 0]);
+            // Reconcile a whole-texture first use with mixed committed states,
+            // then record a whole-texture transition from mixed inline states.
+            let whole = host.new_list().unwrap();
+            crate::list::ensure_state(&whole, image, COPY_SOURCE);
+            crate::list::ensure_subresource_state(&whole, image, 1, COPY_DEST);
+            crate::list::ensure_state(&whole, image, COPY_DEST);
+            whole.close();
+            host.execute(&[&whole], "whole texture transition test");
+            assert_eq!(mixed_states(), [COPY_DEST; 3]);
+            slot::<Release>(list, 0x10)(list);
+        }
+        for object in [upload, allocator, queue, image, source] {
+            slot::<Release>(object, 0x10)(object);
         }
     }
 

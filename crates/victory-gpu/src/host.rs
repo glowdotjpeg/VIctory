@@ -5,7 +5,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -16,6 +16,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
+
+mod states;
+pub(crate) use states::HostTexture;
+use states::RecordedTexture;
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -285,12 +289,10 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
-    /// Host texture states the list assumes, by host copy: at its start and
-    /// at its end. Lists are recorded on many threads and run in submission
-    /// order, so the transitions from a texture's real state are made at
-    /// submission, in `prelude`. Holding the copies keeps every texture the
-    /// list names alive until it is reset, even if the title releases the
-    /// resource first.
+    /// Initial and final states of the host subresources this list uses.
+    /// Lists are recorded on many threads and run in submission order,
+    /// so `prelude` reconciles the states at submission. These entries
+    /// also keep the textures alive until the list is reset.
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
@@ -317,10 +319,7 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+type States = std::collections::HashMap<usize, RecordedTexture>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -492,6 +491,45 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.execute_locked(runs, &mut submitted, operation);
+    }
+
+    /// Records and executes a standalone host read, restoring the source's states.
+    /// Keep the submission lock from the state snapshot through execution.
+    pub(crate) fn execute_texture_read<T>(
+        &self,
+        list: &HostList,
+        source: &HostTexture,
+        subresource: u32,
+        operation: &str,
+        record: impl FnOnce(&ID3D12GraphicsCommandList) -> T,
+    ) -> T {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut barriers = Vec::new();
+        let mut transition = |restore| {
+            barriers.clear();
+            source.visit_states(subresource, |index, state| {
+                let state = D3D12_RESOURCE_STATES(state as i32);
+                let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                if state != copy {
+                    let (before, after) = if restore { (copy, state) } else { (state, copy) };
+                    barriers.push(transition_subresource(&source.texture, index, before, after));
+                }
+            });
+            if !barriers.is_empty() {
+                // SAFETY: an open list and a live source.
+                unsafe { list.list.ResourceBarrier(&barriers) };
+            }
+        };
+        transition(false);
+        let result = record(&list.list);
+        transition(true);
+        list.close();
+        self.execute_locked(&[list], &mut submitted, operation);
+        result
+    }
+
+    fn execute_locked(&self, runs: &[&HostList], submitted: &mut u64, operation: &str) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -918,49 +956,46 @@ impl HostList {
         }
     }
 
-    /// Moves a title texture's host copy to `wanted` (a host state) in this
-    /// list: the host texture and the state it leaves, if that is a change.
-    /// The list's first use of a texture records nothing: its prelude brings
-    /// the texture there at submission.
+    /// Moves host subresources to `wanted` in this list, emitting inline
+    /// barriers for states that are already known and need to change.
     pub(crate) fn transition(
         &self,
-        resource: crate::object::This,
+        copy: Arc<HostTexture>,
+        subresource: u32,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
-        let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        emit: impl FnMut(&ID3D12Resource, u32, u32, u32),
+    ) {
+        let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
-                None
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
-            }
-        }
+        states
+            .entry(Arc::as_ptr(&copy) as usize)
+            .or_insert_with(|| RecordedTexture::new(copy))
+            .record(subresource, wanted, emit);
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
+    #[cfg(test)]
+    pub(crate) fn recorded_state(&self, copy: &Arc<HostTexture>, subresource: u32) -> Option<u32> {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .get(&(Arc::as_ptr(copy) as usize))
+            .and_then(|state| state.last(subresource))
+    }
+
+    /// At submission: the list that reconciles each used subresource with
+    /// the upcoming list's initial state. Commit the final states as well.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
-            })
-            .collect();
+        let mut barriers = Vec::new();
+        for recorded in states.values() {
+            recorded.reconcile(|index, before, after| {
+                barriers.push(transition_subresource(
+                    &recorded.copy.texture,
+                    index,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATES(after as i32),
+                ));
+            });
+        }
         if barriers.is_empty() {
             return None;
         }
@@ -1594,10 +1629,11 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows the source as frame `frame` (saved if captures are on).
+    /// Returns `None` if nothing was shown. In diagnostics builds it reports
+    /// whether the frame was black.
+    pub(crate) fn present(&self, source: &HostTexture, frame: u64) -> Option<bool> {
+        let texture = &source.texture;
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -1630,7 +1666,6 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -1638,34 +1673,36 @@ impl Host {
                 return None;
             };
             p.copy.reset();
-            let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let (mut capture, mut probe) = (None, None);
+            self.execute_texture_read(
+                &p.copy,
+                source,
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                "presentation copy",
+                |list| {
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    list.CopyResource(&back, texture);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        capture = crate::capture::wanted(frame)
+                            .then(|| crate::capture::read_back(&self.device, list, texture))
+                            .flatten();
+                        probe = crate::capture::probe(&self.device, list, texture);
+                    }
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    )]);
+                },
+            );
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
-            p.copy.close();
-            self.execute(&[&p.copy], "presentation copy");
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
@@ -1902,6 +1939,15 @@ pub(crate) fn transition(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> D3D12_RESOURCE_BARRIER {
+    transition_subresource(resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after)
+}
+
+pub(crate) fn transition_subresource(
+    resource: &ID3D12Resource,
+    subresource: u32,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -1909,7 +1955,7 @@ pub(crate) fn transition(
             Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
                 // SAFETY: a borrowed pointer; the barrier never releases it.
                 pResource: unsafe { std::mem::transmute_copy(resource) },
-                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                Subresource: subresource,
                 StateBefore: before,
                 StateAfter: after,
             }),
