@@ -6,7 +6,7 @@
 //! the table as a call.
 //!
 //! Each list records onto a host command list as its methods are called
-//! (decision 0007); draw state lives in [`crate::draw`]. Methods not
+//! (decision 0007); draw state lives in `crate::draw`. Methods not
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -493,6 +493,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::texture::title_written(from) {
+                crate::texture::upload(list, src, from);
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -589,7 +592,9 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
-            list.defer_copy(staging, data, bytes as usize);
+            // The list owns this mapped D3D12 upload buffer. Wine can report
+            // its address as MEM_FREE, so use the host-upload path.
+            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             footprint.offset = 0;
             from.data = CopyLocationData { footprint };
@@ -609,6 +614,9 @@ extern "system" fn copy_texture_region(
                 || (src_subresource == dst_subresource && std::sync::Arc::ptr_eq(&texture, &to))
             {
                 return;
+            }
+            if crate::texture::title_written(&texture.texture) {
+                crate::texture::upload(list, src.resource, &texture.texture);
             }
             ensure_subresource_state(list, src.resource, src_subresource, COPY_SOURCE);
             from.resource = texture.texture.as_raw().cast_const().cast();
