@@ -47,8 +47,92 @@ pub(crate) struct Shadow {
 
 #[derive(Default)]
 struct Before {
-    snapshot: Option<(usize, Vec<u8>)>,
+    snapshot: Sparse,
     unchanged: UnchangedPages,
+}
+
+/// The copy's bytes before the submission ran, for the union of the ranges
+/// its shaders write: sparse runs covering exactly the declared ranges
+/// (merged where they meet or overlap), so disjoint views of a big heap do
+/// not copy the gaps between them. Each byte is read once, before the
+/// submission, and kept to tell later what the GPU wrote.
+#[derive(Default)]
+struct Sparse {
+    /// `(start offset, bytes)` runs in offset order, disjoint and not
+    /// adjacent.
+    runs: Vec<(usize, Vec<u8>)>,
+}
+
+impl Sparse {
+    /// Adds `[from, to)` (offsets in the copy) to the snapshot, reading only
+    /// the newly covered bytes through `host`; bytes a run already holds are
+    /// kept as first read, and runs that meet or overlap are merged.
+    fn insert<'a>(
+        &mut self,
+        from: usize,
+        to: usize,
+        host: impl Fn(usize, usize) -> &'a [u8],
+    ) {
+        if from >= to {
+            return;
+        }
+        // Already within one run: nothing new to read or merge (the world
+        // declares the same ranges dozens of times a submission).
+        if self.covering(from, to).is_some() {
+            return;
+        }
+        // Runs ending before `from` stay put; the rest (through the first
+        // starting after `to`) meet `[from, to)` and merge with it.
+        let first = self.runs.partition_point(|&(at, ref bytes)| at + bytes.len() < from);
+        let last = self.runs.partition_point(|&(at, _)| at <= to);
+        let new_start = if first < last {
+            from.min(self.runs[first].0)
+        } else {
+            from
+        };
+        let new_end = if first < last {
+            let (at, ref bytes) = self.runs[last - 1];
+            to.max(at + bytes.len())
+        } else {
+            to
+        };
+        let mut merged = pooled(new_end - new_start);
+        let mut at = new_start;
+        // Each run's bytes are kept; only the gaps around and between the
+        // runs are read from the copy.
+        for &(run_at, ref run) in &self.runs[first..last] {
+            merged.extend_from_slice(host(at, run_at));
+            merged.extend_from_slice(run);
+            at = run_at + run.len();
+        }
+        merged.extend_from_slice(host(at, new_end));
+        for (_, bytes) in self.runs.drain(first..last) {
+            give_back(bytes);
+        }
+        self.runs.insert(first, (new_start, merged));
+    }
+
+    /// The run wholly covering `[from, to)`: its start offset and bytes.
+    fn covering(&self, from: usize, to: usize) -> Option<(usize, &[u8])> {
+        self.runs
+            .iter()
+            .find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+            .map(|(at, bytes)| (*at, &bytes[..]))
+    }
+
+    /// The bounding offsets of every run (first start, last end), if any.
+    fn span(&self) -> Option<(usize, usize)> {
+        let (at, _) = self.runs.first()?;
+        let (last, bytes) = self.runs.last()?;
+        Some((*at, *last + bytes.len()))
+    }
+
+    /// Returns every run's bytes to the pool.
+    fn clear(&mut self) {
+        for (_, bytes) in self.runs.drain(..) {
+            give_back(bytes);
+        }
+    }
 }
 
 /// Pages already compared in full against this submission's snapshot.
@@ -208,10 +292,11 @@ impl Shadow {
 
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// one snapshot per copy and submission, as sparse runs over exactly the
+    /// declared ranges (the world declares dozens of disjoint views of its
+    /// 174 MB heap; one bounding vector over them copied the gaps too), in
+    /// reused memory (fresh snapshots cost ~2.3 million page faults per
+    /// world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
         self.pending
             .lock()
@@ -221,29 +306,11 @@ impl Shadow {
         // SAFETY: inside the mapping.
         let host =
             |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let before = &mut before.snapshot;
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
-            }
-            None => grown.extend_from_slice(host(start, end)),
-        }
-        *before = Some((start, grown));
+        self.before
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot
+            .insert(from, to, host);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -267,13 +334,13 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
+        if from < to
+            && let Some((taken, bytes)) = snapshot.covering(from, to)
         {
-            unchanged.begin(start + taken, start + taken + before.len());
-            let before = &before[from - taken..to - taken];
+            if let Some((at, end)) = snapshot.span() {
+                unchanged.begin(start + at, start + end);
+            }
+            let before = &bytes[from - taken..to - taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             // An unchanged page is never modified by copy-back, so later
@@ -358,11 +425,9 @@ impl Shadow {
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
+        if pending.is_empty() {
             unchanged.clear();
-            give_back(bytes);
+            snapshot.clear();
         }
         written
     }
@@ -702,6 +767,121 @@ mod tests {
         );
     }
 
+    /// The copy back only ever reads the snapshot's bytes for a declared
+    /// range; proving those are identical to the old bounding-box snapshot's
+    /// bytes (a single vector over the min..max range) proves the copy back
+    /// writes identical bytes, for separated and overlapping declarations.
+    #[test]
+    fn sparse_matches_the_bounding_snapshot_byte_for_byte() {
+        fn bounding(host: &[u8], ranges: &[Range<usize>]) -> (usize, Vec<u8>) {
+            let from = ranges.iter().map(|r| r.start).min().unwrap();
+            let to = ranges.iter().map(|r| r.end).max().unwrap();
+            (from, host[from..to].to_vec())
+        }
+
+        let mut host = vec![0u8; 4 * PAGE];
+        for (i, b) in host.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        for ranges in [
+            // Separated declarations.
+            vec![0..PAGE, 3 * PAGE..4 * PAGE],
+            // Overlapping and adjacent declarations.
+            vec![
+                0..PAGE,
+                PAGE / 2..PAGE + 100,
+                PAGE..2 * PAGE,
+                2 * PAGE..2 * PAGE + 16,
+            ],
+        ] {
+            let mut snapshot = Sparse::default();
+            for r in &ranges {
+                snapshot.insert(r.start, r.end, |a, b| &host[a..b]);
+            }
+            let (from, bytes) = bounding(&host, &ranges);
+            assert_eq!(snapshot.span(), Some((from, from + bytes.len())));
+            // Every declared range reads the bounding box's exact bytes.
+            for r in &ranges {
+                let (at, run) = snapshot.covering(r.start, r.end).expect("covered");
+                assert_eq!(
+                    &run[r.start - at..r.end - at],
+                    &bytes[r.start - from..r.end - from],
+                    "range {r:?} differs from the bounding snapshot"
+                );
+            }
+        }
+    }
+
+    /// Disjoint views of a big heap must not store the gaps between them:
+    /// the runs cover the union of the declared ranges, not their bounding
+    /// box.
+    #[test]
+    fn sparse_snapshot_does_not_copy_the_gaps() {
+        let host = vec![0u8; 4 * PAGE];
+        let ranges = [
+            0..PAGE,
+            PAGE / 2..PAGE,
+            3 * PAGE..3 * PAGE + 500,
+            3 * PAGE + 256..3 * PAGE + 999,
+        ];
+        let mut snapshot = Sparse::default();
+        for r in &ranges {
+            snapshot.insert(r.start, r.end, |a, b| &host[a..b]);
+        }
+        assert_eq!(snapshot.runs.len(), 2);
+        assert_eq!(snapshot.span(), Some((0, 3 * PAGE + 999)));
+        // Only the union is stored: two runs, no 2-page gap.
+        let stored: usize = snapshot.runs.iter().map(|(_, b)| b.len()).sum();
+        assert_eq!(stored, PAGE + 999);
+    }
+
+    /// A later declaration that overlaps a run keeps the first read: it
+    /// never re-reads bytes the snapshot already holds.
+    #[test]
+    fn overlapping_ranges_preserve_the_first_read() {
+        let mut host = [0u8; 200];
+        let mut snapshot = Sparse::default();
+        snapshot.insert(0, 100, |a, b| &host[a..b]);
+        // The copy changes before a later overlapping declaration (a
+        // concurrent write); the first read is what must be kept.
+        host[40..140].fill(0xFF);
+        snapshot.insert(40, 120, |a, b| &host[a..b]);
+        let (at, bytes) = snapshot.covering(0, 120).unwrap();
+        assert_eq!(at, 0);
+        assert_eq!(&bytes[0..40], &[0u8; 40]);
+        assert_eq!(&bytes[40..100], &[0u8; 60], "overlap keeps the first read");
+        assert_eq!(&bytes[100..120], &[0xFF; 20], "newly covered reads fresh");
+    }
+
+    /// Ranges that touch merge into one run; a declaration already covered
+    /// reads nothing new.
+    #[test]
+    fn adjacent_ranges_merge_and_repeats_read_nothing() {
+        let host = (0..200u8).collect::<Vec<_>>();
+        let mut snapshot = Sparse::default();
+        snapshot.insert(0, 100, |a, b| &host[a..b]);
+        snapshot.insert(100, 200, |a, b| &host[a..b]);
+        assert_eq!(snapshot.runs.len(), 1);
+        let (_, bytes) = snapshot.covering(0, 200).unwrap();
+        assert_eq!(bytes, &host[..]);
+        // Re-declaring an already-covered range is a no-op.
+        snapshot.insert(50, 150, |a, b| &host[a..b]);
+        assert_eq!(snapshot.runs.len(), 1);
+        assert_eq!(snapshot.covering(0, 200).unwrap().1, &host[..]);
+    }
+
+    /// An empty declaration (a write at the buffer's very end) must not add
+    /// a far, zero-length run that pulls the coverage out to it.
+    #[test]
+    fn an_empty_range_does_not_grow_the_snapshot() {
+        let host = vec![0u8; 2 * PAGE];
+        let mut snapshot = Sparse::default();
+        snapshot.insert(2 * PAGE, 2 * PAGE, |a, b| &host[a..b]);
+        snapshot.insert(0, 64, |a, b| &host[a..b]);
+        assert_eq!(snapshot.span(), Some((0, 64)));
+        assert_eq!(snapshot.runs.len(), 1);
+    }
+
     // Both versions walk exactly the same declared ranges, in their
     // original order. Only the page comparison differs.
     fn scan(
@@ -794,6 +974,98 @@ mod tests {
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
     }
+
+    /// Times the old one-bounding-vector snapshot against the sparse one
+    /// over `ranges`, five runs each, and prints the medians. Both use the
+    /// shared pool, as the code under test does.
+    fn bench_snapshot(label: &str, host: &[u8], ranges: &[Range<usize>]) {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let mut baseline = [Duration::ZERO; 5];
+        let mut sparse = [Duration::ZERO; 5];
+        for (baseline, sparse) in baseline.iter_mut().zip(&mut sparse) {
+            // The old `writing`: one bounding vector grown over every range.
+            let started = Instant::now();
+            let mut taken: Option<(usize, Vec<u8>)> = None;
+            for r in ranges {
+                let (from, to) = black_box((r.start, r.end));
+                let (start, end) = match &taken {
+                    Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
+                    None => (from, to),
+                };
+                if let Some((at, bytes)) = &taken
+                    && (*at, at + bytes.len()) == (start, end)
+                {
+                    continue;
+                }
+                let mut grown = pooled(end - start);
+                match taken.take() {
+                    Some((at, bytes)) => {
+                        grown.extend_from_slice(&host[start..at]);
+                        grown.extend_from_slice(&bytes);
+                        grown.extend_from_slice(&host[at + bytes.len()..end]);
+                        give_back(bytes);
+                    }
+                    None => grown.extend_from_slice(&host[start..end]),
+                }
+                taken = Some((start, grown));
+            }
+            black_box(&taken);
+            *baseline = started.elapsed();
+            if let Some((_, bytes)) = taken {
+                give_back(bytes);
+            }
+
+            let started = Instant::now();
+            let mut snapshot = Sparse::default();
+            for r in ranges {
+                snapshot.insert(black_box(r.start), black_box(r.end), |a, b| &host[a..b]);
+            }
+            black_box(&snapshot);
+            *sparse = started.elapsed();
+        }
+        baseline.sort_unstable();
+        sparse.sort_unstable();
+        println!(
+            "median of five runs, {label}: bounding {:?} -> sparse {:?} ({:.1}x)",
+            baseline[2],
+            sparse[2],
+            baseline[2].as_secs_f64() / sparse[2].as_secs_f64(),
+        );
+    }
+
+    // cargo test --release -p victory-gpu benchmark_disjoint_snapshot -- --ignored --nocapture
+    /// The sparse snapshot against the old one-bounding-vector snapshot: a
+    /// handful of small disjoint views of a 174 MiB heap. The old version
+    /// copies the whole gap between the views every time one is declared;
+    /// the sparse version reads only the views.
+    #[test]
+    #[ignore = "synthetic CPU release benchmark"]
+    fn benchmark_disjoint_snapshot() {
+        const SIZE: usize = 174 << 20;
+        let host = vec![0xA5u8; SIZE];
+        let ranges: Vec<_> = (0..24)
+            .map(|i| {
+                let at = i * (SIZE / 24) + i;
+                at..at + 256
+            })
+            .collect();
+        bench_snapshot("24 disjoint 256 B views across 174 MiB", &host, &ranges);
+    }
+
+    // cargo test --release -p victory-gpu benchmark_contiguous_snapshot -- --ignored --nocapture
+    /// The sparse snapshot's least favourable case: contiguous ranges that
+    /// keep growing one run. Both schemes copy the accumulated bytes each
+    /// time, so sparse's run lookup and merge overhead shows here; it should
+    /// stay within noise of the bounding baseline, not get worse.
+    #[test]
+    #[ignore = "synthetic CPU release benchmark"]
+    fn benchmark_contiguous_snapshot() {
+        let host = vec![0xA5u8; 24 * PAGE];
+        let ranges: Vec<_> = (0..24).map(|i| i * PAGE..(i + 1) * PAGE).collect();
+        bench_snapshot("24 contiguous 64 KiB ranges", &host, &ranges);
+    }
 }
 
 /// Copy back against real write-watched title memory (a device is needed
@@ -884,6 +1156,111 @@ mod copy_back_tests {
         assert_eq!(a, 0xFF);
         assert_eq!(b, 0x22);
         assert_eq!(c, 0x11);
+
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Two separated declared ranges (and a concurrent title write between
+    /// them) copy back exactly their own pages through the sparse snapshot;
+    /// the pages the shaders did not touch keep the title's writes.
+    #[test]
+    fn copy_back_matches_for_separated_ranges() {
+        let Some(host) = host() else { return };
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                8 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(title, 0);
+        let (buffer, data) = host
+            .shared_buffer(8 * PAGE as u64)
+            .expect("test buffer");
+        let shadow = Shadow::new(buffer, data, 0, title as u64, 8 * PAGE as u64);
+        let mut woken = Woken::default();
+
+        shadow.writing(title + PAGE, PAGE);
+        shadow.writing(title + 5 * PAGE, PAGE);
+        // The shaders write one byte of each declared page.
+        // SAFETY: the test owns this mapping.
+        unsafe {
+            data.add(PAGE + 8).write(0xAA);
+            data.add(5 * PAGE + 8).write(0xCC);
+        }
+        // The title's threads write pages 2 and 6 meanwhile (untouched).
+        // SAFETY: committed pages of ours.
+        unsafe {
+            (title as *mut u8).add(2 * PAGE + 8).write(0x22);
+            (title as *mut u8).add(6 * PAGE + 8).write(0x11);
+        }
+
+        assert_eq!(shadow.copy_back(title + PAGE, PAGE, &mut woken), PAGE);
+        assert_eq!(shadow.copy_back(title + 5 * PAGE, PAGE, &mut woken), PAGE);
+        // SAFETY: the title pages the copy back wrote.
+        assert_eq!(unsafe { (title as *const u8).add(PAGE + 8).read() }, 0xAA);
+        // SAFETY: the title pages the copy back wrote.
+        assert_eq!(unsafe { (title as *const u8).add(5 * PAGE + 8).read() }, 0xCC);
+        // The pages the shaders did not write keep the title's bytes.
+        // SAFETY: committed pages of ours, untouched by the copy back.
+        assert_eq!(unsafe { (title as *const u8).add(2 * PAGE + 8).read() }, 0x22);
+        // SAFETY: committed pages of ours, untouched by the copy back.
+        assert_eq!(unsafe { (title as *const u8).add(6 * PAGE + 8).read() }, 0x11);
+
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// `gpu_writes` clamps a declared length to the bytes left at `address`
+    /// before it is deferred, so a declaration past the buffer's end becomes
+    /// length 0 and one cut short by it keeps only the inside bytes. The
+    /// pending range is keyed by that clamped `(address, address + len)` on
+    /// both sides (`writing` pushes it, `copy_back` retains it), so every
+    /// declaration is cleared exactly once however far out of range it is.
+    #[test]
+    fn a_clamped_declaration_clears_its_pending_range() {
+        let Some(host) = host() else { return };
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(title, 0);
+        let (buffer, data) = host
+            .shared_buffer(2 * PAGE as u64)
+            .expect("test buffer");
+        let shadow = Shadow::new(buffer, data, 0, title as u64, 2 * PAGE as u64);
+        let mut woken = Woken::default();
+
+        let pending = || {
+            shadow
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        };
+
+        // `gpu_writes(title + 2 * PAGE, PAGE)` clamps to `left(...) = 0`;
+        // the deferred range and its pending key are `(title + 2 * PAGE, ...)`.
+        let past = title + 2 * PAGE;
+        shadow.writing(past, 0);
+        assert_eq!(pending(), 1);
+        assert_eq!(shadow.copy_back(past, 0, &mut woken), 0);
+        assert_eq!(pending(), 0, "a length-0 declaration leaves no pending key");
+
+        // `gpu_writes(title + PAGE, 2 * PAGE)` clamps to the `PAGE` bytes
+        // inside; the pending key uses the clamped length.
+        let tail = title + PAGE;
+        shadow.writing(tail, PAGE);
+        assert_eq!(shadow.copy_back(tail, PAGE, &mut woken), 0);
+        assert_eq!(pending(), 0, "a cut-short declaration clears its key");
 
         // SAFETY: our allocation.
         unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
