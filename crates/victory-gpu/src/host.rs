@@ -533,6 +533,29 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        #[cfg(feature = "diagnostics")]
+        if tracing::enabled!(tracing::Level::TRACE) {
+            for (index, &run) in runs.iter().enumerate() {
+                let state_count = run.states.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let (copies, writes) = {
+                    let deferred = run.deferred();
+                    (deferred.copies.len(), deferred.writes.len())
+                };
+                let pipelines = run.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                tracing::trace!(
+                    operation,
+                    next_fence = *submitted + 1,
+                    index,
+                    lists = runs.len(),
+                    state_count,
+                    copies,
+                    writes,
+                    ?pipelines,
+                    notes = %last_notes(&[run]),
+                    "preparing host list"
+                );
+            }
+        }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -563,6 +586,8 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            tracing::trace!(operation, fence = *submitted, host_lists = group.len(), "submitting host lists");
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -592,6 +617,8 @@ impl Host {
                     self.submission_failed(operation, runs, format_args!("device removed"));
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            tracing::trace!(operation, fence = *submitted, "host fence completed");
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
