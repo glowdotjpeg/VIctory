@@ -1113,6 +1113,18 @@ extern "system" fn clear_rtv(
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            let frame = crate::queue::presented() + 1;
+            if crate::capture::listed(frame) {
+                use windows::core::Interface;
+                tracing::debug!(
+                    target: "victory_gpu::capture::passes",
+                    frame, list = ?list.list.as_raw(), target = ?record.resource,
+                    ?color, count, "captured render target clear"
+                );
+            }
+        }
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }

@@ -859,7 +859,7 @@ impl State {
                 }
             }
         }
-        let _ = write!(text, " tables {:?}", self.reads(compute));
+        let _ = write!(text, " tables {:?}", self.reads(compute, false));
         text
     }
 
@@ -1074,7 +1074,7 @@ impl State {
             v.address,
             v.size,
             v.stride,
-            self.reads(false)
+            self.reads(false, false)
         );
         if logged {
             tracing::debug!("draw {line}");
@@ -1088,18 +1088,27 @@ impl State {
     /// What a draw's shaders read, one line per used resource (diagnostics
     /// builds).
     #[cfg(feature = "diagnostics")]
-    fn reads(&self, compute: bool) -> Vec<String> {
+    fn reads(&self, compute: bool, note_inputs: bool) -> Vec<String> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
         for stage in &p.stages {
+            let note_inputs = note_inputs
+                && crate::pipeline::selected_for_diagnostics(&stage.shader.hash);
             let t = stage.translated();
             for u in &t.used {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::view(handle).as_ref())
+                        let view = crate::descriptor::view(handle);
+                        if note_inputs
+                            && u.kind == ResourceType::Srv
+                            && let Some(View::Shader(resource, _)) = &view
+                        {
+                            crate::capture::note_target(*resource as This);
+                        }
+                        describe(view.as_ref())
                     }
                     (root, _) => format!("{root:?}"),
                 };
@@ -1144,7 +1153,7 @@ impl State {
             topology = self.topology,
             ?targets,
             ?depth,
-            views = ?recorded.then(|| self.reads(compute)),
+            views = ?recorded.then(|| self.reads(compute, true)),
             "captured pass"
         );
     }
