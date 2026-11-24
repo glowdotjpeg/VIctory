@@ -28,10 +28,32 @@ pub(crate) fn listed(n: u64) -> bool {
             .collect()
     })
     .contains(&n)
-        || (n != 0 && n == NEXT_BUSY.load(Relaxed))
+        || (n != 0 && (n == NEXT_BUSY.load(Relaxed) || n == SHADER_FRAME.load(Relaxed)))
 }
 
 static NEXT_BUSY: AtomicU64 = AtomicU64::new(0);
+static SHADER_FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// Capture the first frame that records a dispatch using the requested
+/// shader, even if missing pipelines keep it below the busy-frame threshold.
+pub(crate) fn note_shader_frame<'a>(mut shaders: impl Iterator<Item = &'a str>) {
+    static MATCH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(selected) = MATCH
+        .get_or_init(|| {
+            folder()?;
+            std::env::var("VICTORY_CAPTURE_ON_SHADER").ok()
+        })
+        .as_deref()
+    else {
+        return;
+    };
+    if SHADER_FRAME.load(Relaxed) == 0 && shaders.any(|hash| hash.eq_ignore_ascii_case(selected)) {
+        let frame = crate::queue::presented() + 1;
+        if SHADER_FRAME.compare_exchange(0, frame, Relaxed, Relaxed).is_ok() {
+            tracing::info!(frame, shader = selected, "capturing the first frame using a shader");
+        }
+    }
+}
 
 /// `VICTORY_CAPTURE_BUSY=<draws>[,<count>]` selects frames after unusually
 /// busy frames, up to `count` times (default two). World loading can reach

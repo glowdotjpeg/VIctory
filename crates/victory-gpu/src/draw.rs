@@ -735,7 +735,12 @@ impl State {
         }
         let ran = self.bind(list, p, true);
         #[cfg(feature = "diagnostics")]
-        self.trace_pass(list, "dispatch", true, ran);
+        {
+            if ran {
+                crate::capture::note_shader_frame(p.stages.iter().map(|s| s.shader.hash.as_str()));
+            }
+            self.trace_pass(list, "dispatch", true, ran);
+        }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
