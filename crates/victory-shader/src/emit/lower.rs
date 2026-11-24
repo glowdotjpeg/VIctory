@@ -7262,7 +7262,7 @@ mod tests {
             let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
             let st = structure::structure(&p).unwrap();
             let io = io::raise(&p, &native).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let lowered = lower(&Parts {
                 native: &native,
                 p: &p,
