@@ -744,7 +744,86 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        self.probe_dispatch_writes(list, p);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn probe_dispatch_writes(&self, list: &HostList, pipeline: &HostPipeline) {
+        let frame = crate::queue::presented() + 1;
+        if !crate::capture::listed(frame) {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        for stage in &pipeline.stages {
+            if !crate::pipeline::selected_for_diagnostics(&stage.shader.hash) {
+                continue;
+            }
+            for u in &stage.translated().used {
+                if u.kind != ResourceType::Uav || u.root != RootType::Table {
+                    continue;
+                }
+                let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let Some(view) =
+                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                else {
+                    continue;
+                };
+                let Some((address, len @ 4..=16384)) = crate::descriptor::host::buffer_range(&view)
+                else {
+                    continue;
+                };
+                let Some(shadow) = crate::shadow::find(address, len) else {
+                    continue;
+                };
+                let len = len.min(shadow.left(address)) & !3;
+                static PROBES: AtomicU64 = AtomicU64::new(0);
+                if len == 0 || PROBES.fetch_add(1, Ordering::Relaxed) >= 16 {
+                    continue;
+                }
+                let Some((sample, mapped)) = list.readback(host, len) else {
+                    continue;
+                };
+                list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+                // SAFETY: the clamped range is in the host copy. The list
+                // keeps the readback alive through its completion callback.
+                unsafe {
+                    list.list.CopyBufferRegion(
+                        &sample,
+                        0,
+                        &shadow.buffer,
+                        shadow.offset(address),
+                        len,
+                    );
+                }
+                let mapped = mapped as usize;
+                let shader = stage.shader.hash.clone();
+                list.defer_probe(move || {
+                    // SAFETY: the GPU fence has completed the copy, and the
+                    // mapped readback holds len bytes of u32 data.
+                    let words = unsafe {
+                        std::slice::from_raw_parts(mapped as *const u32, (len / 4) as usize)
+                    };
+                    let mut frequencies = std::collections::BTreeMap::new();
+                    let mut values = Vec::new();
+                    for (i, &value) in words.iter().enumerate() {
+                        *frequencies.entry(value).or_insert(0) += 1;
+                        if value != 0 && values.len() < 256 {
+                            values.push((i, value));
+                        }
+                    }
+                    tracing::info!(
+                        frame, %shader, address = format_args!("{address:#x}"), len,
+                        ?frequencies, ?values, "sampled dispatch buffer writes"
+                    );
+                });
+            }
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report

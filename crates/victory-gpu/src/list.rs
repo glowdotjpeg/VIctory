@@ -488,6 +488,15 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         if has_buffer_barriers {
             host.push(UAV_BARRIER);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::listed(crate::queue::presented() + 1) {
+            use windows::core::Interface;
+            tracing::debug!(
+                target: "victory_gpu::capture::passes",
+                list = ?list.list.as_raw(), count, emitted = host.len(), has_buffer_barriers,
+                "captured title barriers"
+            );
+        }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -1259,7 +1268,19 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+extern "system" fn sync(_this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if crate::capture::listed(crate::queue::presented() + 1)
+        && let Some(list) = host_list(_this)
+    {
+        use windows::core::Interface;
+        tracing::debug!(
+            target: "victory_gpu::capture::passes",
+            list = ?list.list.as_raw(), flags = _flags, control = _control,
+            address = format_args!("{_address:#x}"), size = _size, "captured title pipeline sync"
+        );
+    }
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1731,6 +1752,14 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::listed(crate::queue::presented() + 1) {
+            use windows::core::Interface;
+            tracing::debug!(
+                target: "victory_gpu::capture::passes",
+                list = ?list.list.as_raw(), count, "captured title enhanced barriers"
+            );
+        }
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
