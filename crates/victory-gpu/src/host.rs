@@ -661,6 +661,262 @@ mod tests {
         }
         assert!(errors.is_empty(), "debug layer errors: {errors:#?}");
     }
+
+    /// The batching rule: a list's CPU copy of title memory splits the
+    /// submission only when its source overlaps a range an earlier list's
+    /// shaders write; disjoint and merely touching ranges (one ends where
+    /// the other begins) stay in one submission.
+    #[test]
+    fn only_overlapping_copy_sources_split_the_submission() {
+        let writes = [(0x1000, 0x1100), (0x2000, 0x3000)];
+        assert!(overlaps_write(&writes, 0x1080, 8), "inside a write");
+        assert!(overlaps_write(&writes, 0x0ff0, 0x20), "across its start");
+        assert!(overlaps_write(&writes, 0x10f0, 0x20), "across its end");
+        assert!(overlaps_write(&writes, 0x2080, 0x800), "inside the other");
+        assert!(overlaps_write(&writes, 0x0ff0, 0x2100), "across both");
+        assert!(!overlaps_write(&writes, 0x1100, 8), "touching after it");
+        assert!(!overlaps_write(&writes, 0x0f00, 0x100), "touching before it");
+        assert!(!overlaps_write(&writes, 0x3000, 8), "touching after the last");
+        assert!(!overlaps_write(&writes, 0x1180, 0x100), "between them");
+        assert!(!overlaps_write(&[], 0x1000, 8), "no writes, no split");
+        assert!(!overlaps_write(&writes, 0x1080, 0), "nothing read, no split");
+    }
+
+    /// Set in the child process `in_warp_child` starts.
+    const WARP_CHILD: &str = "VICTORY_TEST_WARP_CHILD";
+
+    /// Runs the test `name` alone in a child process with the host device
+    /// on the software adapter (the ordering shows on any adapter; WARP
+    /// keeps the test off hardware). One test at a time: the host device
+    /// is global and made before the first use.
+    fn in_warp_child(name: &str) -> bool {
+        if std::env::var_os(WARP_CHILD).is_some() {
+            return false;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&format!("host::tests::{name}"), "--exact", "--nocapture"])
+            .env(WARP_CHILD, "1")
+            .env("VICTORY_D3D12_WARP", "1")
+            .env_remove("VICTORY_D3D12_DEBUG")
+            .env_remove("VICTORY_D3D12_GBV")
+            .env_remove("VICTORY_D3D12_DRED")
+            .env_remove("VICTORY_GPU_TIMING")
+            .env_remove("VICTORY_COPY_MODE")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!("{text}");
+        assert!(out.status.success(), "the child test failed");
+        assert!(text.contains("1 passed"), "the child ran no test");
+        true
+    }
+
+    /// Whether the host device is on the software adapter: without it the
+    /// WARP setting is ignored (diagnostics builds) and the test would run
+    /// on hardware.
+    fn on_warp(host: &Host) -> bool {
+        // SAFETY: plain DXGI and D3D12 queries.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return false;
+            };
+            let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
+                return false;
+            };
+            let Ok(desc) = warp.GetDesc1() else { return false };
+            let device = host.device.GetAdapterLuid();
+            (device.LowPart, device.HighPart) == (desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart)
+        }
+    }
+
+    /// What the test's dispatch writes, dword `i` of the range.
+    const WRITE_PATTERN: u32 = 0xC0DE_0000;
+
+    /// A shader whose dispatch writes 64 dwords (256 bytes) at the start
+    /// of the buffer it is given (as a shader's unordered access does).
+    const WRITE_SOURCE: &str = r#"
+        #define RS "RootFlags(0), UAV(u0)"
+        RWByteAddressBuffer out_buffer : register(u0);
+        [RootSignature(RS)] [numthreads(64, 1, 1)]
+        void cs(uint i : SV_DispatchThreadID) {
+            out_buffer.Store(i * 4, 0xC0DE0000u + i);
+        }
+    "#;
+
+    /// The pipeline of [`WRITE_SOURCE`].
+    fn write_pipeline(host: &Host) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        use windows::core::s;
+        let cs = compile(WRITE_SOURCE, s!("cs"), s!("cs_5_1"));
+        // SAFETY: the shader bytes live through the call; our objects.
+        unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &cs).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: cs.as_ptr().cast(),
+                        BytecodeLength: cs.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        }
+    }
+
+    /// Records into `a`: the refresh that gives the shaders the title's
+    /// data, a dispatch whose shaders write the range, and the copy-back
+    /// of what they wrote once the list has run.
+    fn record_gpu_write(
+        a: &HostList,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        at: u64,
+        (root, pso): (&ID3D12RootSignature, &ID3D12PipelineState),
+    ) {
+        shadow.refresh(a, at, 256);
+        shadow.gpu_writes(a, at, 256);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { shadow.buffer.GetGPUVirtualAddress() } + shadow.offset(at);
+        a.buffer_state(&shadow.buffer, BUFFER_WRITE);
+        // SAFETY: an open list; our objects, alive until the lists ran.
+        unsafe {
+            let l = &a.list;
+            l.SetComputeRootSignature(root);
+            l.SetPipelineState(pso);
+            l.SetComputeRootUnorderedAccessView(0, gpu);
+            l.Dispatch(1, 1, 1);
+        }
+    }
+
+    /// A title buffer for the synthetic ordering tests: the memory the
+    /// test owns (`title`), with its host copy.
+    fn title_buffer(title: &mut Vec<u8>) -> std::sync::Arc<crate::shadow::Shadow> {
+        let at = title.as_ptr() as u64;
+        crate::shadow::register(1, at, title.len() as u64);
+        crate::shadow::find(at, title.len() as u64).unwrap()
+    }
+
+    /// List A's shaders write a range of a title buffer's host copy; list
+    /// B, submitted in the same execute, CPU-copies title memory out of
+    /// that range (as a title buffer copy whose source is there). In title
+    /// order the copy runs after the shaders: the submission must split,
+    /// so the copy reads what they wrote once it went back. Without the
+    /// split both lists run before the write lands and the copy keeps the
+    /// old bytes.
+    #[test]
+    fn a_copy_of_memory_an_earlier_list_wrote_waits_for_the_write() {
+        if in_warp_child("a_copy_of_memory_an_earlier_list_wrote_waits_for_the_write") {
+            return;
+        }
+        let Some(host) = host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        if !on_warp(host) {
+            eprintln!("not on the software adapter; skipped");
+            return;
+        }
+        // Title memory: 64 KiB the test owns (the copies read it through
+        // the kernel, as they do the title's). The write at the start, the
+        // copy out of it, its result past the middle.
+        let mut title = vec![0u8; 1 << 16];
+        let at = title.as_ptr() as u64;
+        let shadow = title_buffer(&mut title);
+        let (root, pso) = write_pipeline(host);
+
+        let (a, b) = (host.new_list().unwrap(), host.new_list().unwrap());
+        record_gpu_write(&a, &shadow, at, (&root, &pso));
+        a.close();
+        let to = title[4096..].as_mut_ptr();
+        let from = title.as_ptr();
+        b.defer_copy(to, from, 256);
+        b.close();
+
+        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.execute(&[&a, &b], "synthetic copy after a GPU write");
+        let after = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            after - before,
+            2,
+            "the copy must wait for the earlier list's write: one submission each"
+        );
+        for (i, got) in title[4096..4096 + 256].chunks_exact(4).enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(got.try_into().unwrap()),
+                WRITE_PATTERN + i as u32,
+                "the copy read what the shaders wrote"
+            );
+        }
+        for (i, got) in title[..256].chunks_exact(4).enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(got.try_into().unwrap()),
+                WRITE_PATTERN + i as u32,
+                "the write went back into title memory"
+            );
+        }
+        crate::shadow::unregister(1, at);
+    }
+
+    /// As [`a_copy_of_memory_an_earlier_list_wrote_waits_for_the_write`],
+    /// but the copy's source lies outside the range the shaders write:
+    /// it reads none of what they write, so the lists keep batching in one
+    /// submission (and the copy reads what was there when it ran).
+    #[test]
+    fn a_nonoverlapping_copy_stays_batched_with_the_write() {
+        if in_warp_child("a_nonoverlapping_copy_stays_batched_with_the_write") {
+            return;
+        }
+        let Some(host) = host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        if !on_warp(host) {
+            eprintln!("not on the software adapter; skipped");
+            return;
+        }
+        let mut title = vec![0u8; 1 << 16];
+        let at = title.as_ptr() as u64;
+        let shadow = title_buffer(&mut title);
+        let (root, pso) = write_pipeline(host);
+        // The copy's source, written by the test: outside the write's
+        // range.
+        title[8192..8192 + 256].fill(0xAA);
+
+        let (a, b) = (host.new_list().unwrap(), host.new_list().unwrap());
+        record_gpu_write(&a, &shadow, at, (&root, &pso));
+        a.close();
+        let to = title[4096..].as_mut_ptr();
+        let from = title[8192..].as_ptr();
+        b.defer_copy(to, from, 256);
+        b.close();
+
+        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.execute(&[&a, &b], "synthetic copy next to a GPU write");
+        let after = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            after - before,
+            1,
+            "the copy reads none of the write: one submission"
+        );
+        assert!(
+            title[4096..4096 + 256].iter().all(|&b| b == 0xAA),
+            "the copy read what was there when it ran"
+        );
+        for (i, got) in title[..256].chunks_exact(4).enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(got.try_into().unwrap()),
+                WRITE_PATTERN + i as u32,
+                "the write went back into title memory"
+            );
+        }
+        crate::shadow::unregister(1, at);
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -1139,8 +1395,6 @@ impl Host {
         }
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::Submissions, 1);
-        #[cfg(feature = "diagnostics")]
         if tracing::enabled!(tracing::Level::TRACE) {
             for (index, &run) in runs.iter().enumerate() {
                 let state_count = run.states.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -1164,20 +1418,114 @@ impl Host {
             }
         }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
+        // Where each of the submission's runs' lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        // The runs of the submission being prepared.
+        let mut batch: Vec<usize> = Vec::with_capacity(runs.len());
         let mut woken = crate::fence::Woken::default();
-        for list in runs {
-            list.run_deferred(&mut batch, &mut woken);
+        let mut batcher = Batch::default();
+        // Title ranges the submission's shaders write so far: title memory
+        // there is older than the lists' host copies until it is copied
+        // back.
+        let mut writing: Vec<TitleRange> = Vec::new();
+        // Where the last submission ended (the time between it and the
+        // next one is preparing, `SUBMISSION_US[0]`).
+        let mut done = started;
+        for (index, list) in runs.iter().enumerate() {
+            let (copies, own_writes, self_overlap) = list.copy_plan();
+            if !batch.is_empty() && copies.iter().any(|&(at, len)| overlaps_write(&writing, at, len))
+            {
+                // In title order this list's copy reads after the earlier
+                // lists' shaders wrote: only once those lists ran and the
+                // writes went back does title memory hold what it would
+                // read. Run the lists prepared so far and copy their
+                // writes back before preparing this one; lists whose
+                // copies read elsewhere keep batching in one submission.
+                batcher.title_written();
+                #[cfg(feature = "diagnostics")]
+                tracing::debug!(
+                    operation,
+                    next_fence = *submitted + 1,
+                    index,
+                    writes = ?writing,
+                    "the submission splits: a copy reads a range an earlier list's shaders write"
+                );
+                self.run_batch(
+                    runs,
+                    &batch,
+                    &lists,
+                    &firsts,
+                    submitted,
+                    operation,
+                    &mut woken,
+                    &mut done,
+                );
+                lists.clear();
+                batch.clear();
+                firsts.clear();
+                writing.clear();
+            }
+            if self_overlap {
+                // One list: the copy is prepared before the list runs,
+                // whatever the recorded order; only a split between lists
+                // can restore title order.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "a host list copies title memory a dispatch of its own wrote: \
+                         the copy is prepared before the list runs"
+                    );
+                });
+            }
+            list.run_deferred(&mut batcher, &mut woken);
+            writing.extend(own_writes);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            batch.push(index);
         }
-        batch.flush();
+        batcher.title_written();
+        self.run_batch(
+            runs,
+            &batch,
+            &lists,
+            &firsts,
+            submitted,
+            operation,
+            &mut woken,
+            &mut done,
+        );
+        woken
+    }
+
+    /// Runs the submission's lists and waits for them, then copies the
+    /// ranges its shaders wrote back into title memory and applies the
+    /// lists' bottom-of-pipe writes, so the next submission's preparation
+    /// (its CPU copies of title memory) sees what they wrote.
+    #[allow(clippy::too_many_arguments)]
+    fn run_batch(
+        &self,
+        runs: &[&HostList],
+        batch: &[usize],
+        lists: &[Option<ID3D12CommandList>],
+        firsts: &[usize],
+        submitted: &mut u64,
+        operation: &str,
+        woken: &mut crate::fence::Woken,
+        done: &mut std::time::Instant,
+    ) {
+        if lists.is_empty() {
+            return;
+        }
         let prepared = std::time::Instant::now();
+        SUBMISSION_US[0].fetch_add(
+            (prepared - *done).as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -1191,6 +1539,8 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = firsts;
         for (i, group) in groups.iter().enumerate() {
             // SAFETY: a status query on our device.
             if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -1239,35 +1589,43 @@ impl Host {
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let commands = runs[batch[i]]
+                    .notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                for (ms, op) in runs[batch[i]].slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
             let _ = (i, started);
         }
-        let _ = &firsts;
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = runs
+            let pipelines: std::collections::BTreeSet<String> = batch
                 .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .flat_map(|&r| {
+                    runs[r].pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                })
                 .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            tracing::warn!(ms = gpu.as_millis(), lists = batch.len(), ?pipelines, "slow host submission");
         }
-        // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
+        // From here on: what the title must see before the next
+        // preparation, and the time between submissions is copying, not
+        // preparing.
+        *done = std::time::Instant::now();
+        // What the submission's shaders wrote goes back before the
+        // bottom-of-pipe writes, which tell the title the GPU is done; each
+        // range once per submission, however many lists declared it (the
+        // world's passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
+        for &r in batch {
+            for step in &runs[r].deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && !back
                         .iter()
@@ -1279,7 +1637,7 @@ impl Host {
         }
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len, &mut woken);
+            let written = shadow.copy_back(address, len, woken);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         // Texture readbacks land in title memory before the completion
@@ -1316,8 +1674,8 @@ impl Host {
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Queues these writes release run their work once no lock is held:
         // it submits lists itself (this lock, the lists' `deferred`).
-        for list in runs {
-            for &(at, what, bytes) in &list.deferred().writes {
+        for &r in batch {
+            for &(at, what, bytes) in &runs[r].deferred().writes {
                 woken.add(what.write(at as *mut u8, bytes));
                 #[cfg(feature = "diagnostics")]
                 if crate::fence::trace_memory_waits() {
@@ -1333,7 +1691,6 @@ impl Host {
             }
         }
         self.log_messages();
-        woken
     }
 
     fn submission_failed(
@@ -1525,6 +1882,23 @@ impl Host {
             handle
         }
     }
+}
+
+/// A range of title memory: its start and its end.
+type TitleRange = (usize, usize);
+
+/// Whether a CPU copy of title memory `[at, at + len)` reads a range the
+/// submission's shaders write on the GPU (`writing`: the title ranges of
+/// the GPU writes declared so far): the two overlap, so in title order the
+/// copy runs after the shaders and must not read before their lists ran
+/// and the writes went back. Disjoint and merely touching ranges (one ends
+/// where the other begins) do not overlap.
+fn overlaps_write(writing: &[TitleRange], at: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    writing.iter().any(|&(from, to)| from < to && at < to && from < end)
 }
 
 impl HostList {
@@ -1834,6 +2208,34 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What the list needs from the submission it goes into: the title
+    /// ranges its CPU copies read (the sources of its title-to-title
+    /// copies and of its fills of upload memory), the title ranges its
+    /// shaders write (`GpuWrite` steps, cut to their buffers), and whether
+    /// a copy of its own reads one of its own earlier GPU writes (out of
+    /// title order within one list, which no split can fix).
+    fn copy_plan(&self) -> (Vec<TitleRange>, Vec<TitleRange>, bool) {
+        let deferred = self.deferred();
+        let mut sources = Vec::new();
+        let mut writes = Vec::new();
+        let mut self_overlap = false;
+        for step in &deferred.copies {
+            match step {
+                Step::Copy(_, src, len) | Step::Fill(_, src, len) => {
+                    if overlaps_write(&writes, *src, *len) {
+                        self_overlap = true;
+                    }
+                    sources.push((*src, *len));
+                }
+                Step::GpuWrite(shadow, address, len) => {
+                    writes.push(shadow.clamped(*address, *len));
+                }
+                _ => {}
+            }
+        }
+        (sources, writes, self_overlap)
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.

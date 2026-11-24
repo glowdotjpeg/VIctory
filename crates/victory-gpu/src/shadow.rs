@@ -178,6 +178,13 @@ impl Shadow {
         }
     }
 
+    /// `[address, address + len)` cut to the buffer, as title addresses:
+    /// what the copy stands for.
+    pub(crate) fn clamped(&self, address: usize, len: usize) -> (usize, usize) {
+        let (from, to) = self.inside(address, len);
+        (self.start as usize + from, self.start as usize + to)
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
