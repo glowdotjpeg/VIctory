@@ -239,7 +239,7 @@ pub(crate) fn read_back(
     }
 }
 
-/// Records a snapshot of a small integer mask at its use on the GPU.
+/// Records a snapshot of an integer mask or scalar float texture at its use on the GPU.
 pub(crate) fn probe_mask(
     list: &crate::host::HostList,
     resource: crate::object::This,
@@ -254,14 +254,15 @@ pub(crate) fn probe_mask(
     };
     // SAFETY: the host copy is live.
     let desc = unsafe { copy.texture.GetDesc() };
-    let texel_bytes = match desc.Format {
-        DXGI_FORMAT_R8_UINT => 1,
-        DXGI_FORMAT_R32_UINT => 4,
+    let (texel_bytes, max_width, max_height) = match desc.Format {
+        DXGI_FORMAT_R8_UINT => (1, 512, 512),
+        DXGI_FORMAT_R32_UINT => (4, 512, 512),
+        DXGI_FORMAT_R32_FLOAT => (4, 2560, 1440),
         _ => return,
     };
     if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        || desc.Width > 512
-        || desc.Height > 512
+        || desc.Width > max_width
+        || desc.Height > max_height
         || desc.DepthOrArraySize != 1
         || desc.MipLevels != 1
         || desc.SampleDesc.Count != 1
@@ -278,6 +279,7 @@ pub(crate) fn probe_mask(
         return;
     };
     let resource = resource as usize;
+    let floating = desc.Format == DXGI_FORMAT_R32_FLOAT;
     list.defer_probe(move || {
         let f = footprint.Footprint;
         let mut data = std::ptr::null_mut();
@@ -293,9 +295,16 @@ pub(crate) fn probe_mask(
             );
             let mut nonzero = 0;
             let mut bits = 0;
+            let mut finite_nonzero = 0;
+            let mut nonfinite = 0;
             let mut add = |value: u32| {
                 nonzero += u32::from(value != 0);
                 bits |= value;
+                if floating {
+                    let v = f32::from_bits(value);
+                    finite_nonzero += u32::from(v.is_finite() && v != 0.0);
+                    nonfinite += u32::from(!v.is_finite());
+                }
             };
             for y in 0..f.Height as usize {
                 let start = footprint.Offset as usize + y * f.RowPitch as usize;
@@ -307,6 +316,14 @@ pub(crate) fn probe_mask(
                 }
             }
             buffer.Unmap(0, Some(&D3D12_RANGE::default()));
+            if floating {
+                tracing::info!(
+                    dispatch, stage, slot, table_offset, resource = format_args!("{resource:#x}"),
+                    width = f.Width, height = f.Height, finite_nonzero, nonfinite,
+                    "sampled float texture at dispatch"
+                );
+                return;
+            }
             tracing::info!(
                 dispatch, stage, slot, table_offset, resource = format_args!("{resource:#x}"),
                 width = f.Width, height = f.Height, nonzero, bits = format_args!("{bits:#x}"),

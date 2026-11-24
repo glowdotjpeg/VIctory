@@ -767,22 +767,31 @@ impl State {
         list: &HostList,
         pipeline: &'a HostPipeline,
     ) -> Option<(u64, &'a [UsedResource])> {
-        static SHADER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        static SAMPLES: AtomicU64 = AtomicU64::new(0);
-        let selected = SHADER
-            .get_or_init(|| std::env::var("VICTORY_PROBE_MASK_SHADER").ok())
-            .as_deref()?;
-        let stage = pipeline
-            .stages
-            .iter()
-            .find(|s| s.shader.hash.eq_ignore_ascii_case(selected))?;
-        let id = SAMPLES.fetch_add(1, Ordering::Relaxed);
-        if id >= 4 {
+        static SHADERS: std::sync::OnceLock<Vec<(String, AtomicU64)>> = std::sync::OnceLock::new();
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let selected = SHADERS.get_or_init(|| {
+            std::env::var("VICTORY_PROBE_MASK_SHADER")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|hash| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                .take(8)
+                .map(|hash| (hash.to_owned(), AtomicU64::new(0)))
+                .collect()
+        });
+        let (stage, samples) = pipeline.stages.iter().find_map(|stage| {
+            selected
+                .iter()
+                .find(|(hash, _)| stage.shader.hash.eq_ignore_ascii_case(hash))
+                .map(|(_, samples)| (stage, samples))
+        })?;
+        if samples.fetch_add(1, Ordering::Relaxed) >= 4 {
             return None;
         }
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let used = &stage.translated().used;
         self.probe_masks(list, used, id, ResourceType::Srv);
-        tracing::info!(dispatch = id, shader = selected, "probing integer masks");
+        tracing::info!(dispatch = id, shader = stage.shader.hash, "probing integer masks");
         Some((id, used))
     }
 
