@@ -732,7 +732,7 @@ fn probe_args(
         return;
     };
     static SAMPLED: AtomicU32 = AtomicU32::new(0);
-    if SAMPLED.fetch_add(1, Relaxed) >= 24 {
+    if SAMPLED.fetch_add(1, Relaxed) >= 256 {
         return;
     }
     let records = u64::from(max.min(4));
