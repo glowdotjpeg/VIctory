@@ -116,16 +116,48 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        self.dump_failed();
+                    }
                 }
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// Keeps failed inputs for offline translation checks on this machine.
+    #[cfg(feature = "diagnostics")]
+    fn dump_failed(&self) {
+        use std::io::{ErrorKind, Write};
+        use std::path::PathBuf;
+
+        static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+        let Some(dir) = DIR.get_or_init(|| {
+            let dir = PathBuf::from(std::env::var_os("VICTORY_DUMP_FAILED")?);
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => Some(dir),
+                Err(error) => {
+                    tracing::warn!(?dir, %error, "failed shader dump directory is unavailable");
+                    None
+                }
+            }
+        }) else {
+            return;
+        };
+        let path = dir.join(format!("{}-{}.dxbc", self.stage, self.hash));
+        let saved = std::fs::File::create_new(&path).and_then(|mut file| file.write_all(&self.container));
+        if let Err(error) = saved
+            && error.kind() != ErrorKind::AlreadyExists
+        {
+            tracing::warn!(?path, %error, "could not save failed shader");
+        }
     }
 }
 
