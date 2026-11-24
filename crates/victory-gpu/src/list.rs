@@ -131,7 +131,10 @@ struct List {
 pub(crate) struct Prefix {
     /// None for a leading wait or a wait immediately following another.
     pub list: Option<std::sync::Arc<crate::host::HostList>>,
-    pub predicate: crate::fence::Predicate,
+    /// None for a split the recording makes itself (`list_for_title_copy`):
+    /// the queue still runs the closed segment before the rest, and no
+    /// memory is waited on.
+    pub predicate: Option<crate::fence::Predicate>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -574,9 +577,10 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if host_list(this).is_some()
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && let Some(list) = list_for_title_copy(this, from, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -610,7 +614,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
-        ) {
+        ) && let Some(list) = list_for_title_copy(this, from, a.min(b) as usize)
+        {
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
@@ -686,7 +691,7 @@ extern "system" fn copy_texture_region(
         const SUBRESOURCE: u32 = 0;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
-        let (Some(list), Some(&dst), Some(&src)) =
+        let (Some(mut list), Some(&dst), Some(&src)) =
             (host_list(this), unsafe { dst.as_ref() }, unsafe {
                 src.as_ref()
             })
@@ -904,6 +909,13 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, footprint.offset, bytes) else {
                 return;
             };
+            // The fill of the upload reads the footprint's title bytes at
+            // submission preparation: when the recording's dispatches
+            // write them, this whole copy records after them (as a buffer
+            // copy does), into the segment the queue runs next.
+            if let Some(again) = list_for_title_copy(this, data, bytes as usize) {
+                list = again;
+            }
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
@@ -1162,19 +1174,23 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if host_list(this).is_some()
         && dst != 0
         && src != 0
     {
         let len = len as usize;
-        list.defer(dst as usize, len, move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        // The copy reads title memory at submission preparation, so it
+        // records behind the writes it reads, as a buffer copy does.
+        if let Some(list) = list_for_title_copy(this, src as *const u8, len) {
+            list.defer(dst as usize, len, move || {
+                if crate::texture::committed(src as *const u8, len)
+                    && crate::texture::committed(dst as *const u8, len)
+                {
+                    // SAFETY: both ranges are committed title memory.
+                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                }
+            });
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
@@ -1746,16 +1762,69 @@ fn record_wait(
             .unwrap_or_else(|e| e.into_inner())
             .push(Prefix {
                 list: prefix,
-                predicate: crate::fence::Predicate {
+                predicate: Some(crate::fence::Predicate {
                     address: address as usize,
                     operand,
                     comparison,
                     reference,
-                },
+                }),
             });
     }
     #[cfg(not(windows))]
     let _ = (this, address, comparison, reference, operand, flags);
+}
+
+/// The host list a deferred copy of title memory records into: the list's
+/// own, unless its source `[src, src + len)` intersects a range the
+/// recording has already declared filled once the list has run — a
+/// dispatch's shader write (`GpuWrite`), a readback, or a bottom-of-pipe
+/// completion write. Those land in title memory only once the list's
+/// submission has run, while the copy is prepared before the list runs —
+/// recording it there would read the old bytes. Then the same native
+/// split a wait does, without a predicate: the queue runs the closed
+/// segment, whose writes go back into title memory, before it runs the
+/// new one the copy goes into.
+#[cfg(windows)]
+fn list_for_title_copy(
+    this: This,
+    src: *const u8,
+    len: usize,
+) -> Option<std::sync::Arc<crate::host::HostList>> {
+    let current = host_list(this)?;
+    if !current.copy_reads_earlier_write(src, len) {
+        return Some(current);
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let host = crate::host::host()?;
+    let Ok(next) = host.acquire_list() else {
+        // Without a segment to run first, the copy cannot be ordered
+        // behind the writes; recording it here keeps the run going.
+        tracing::warn!("no host list to split a copy behind the writes it reads");
+        return list.host.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    };
+    let prefix = {
+        let mut held = list.host.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = held.as_ref()?;
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        previous.close();
+        previous.keep_dynamic(state.take_dynamic());
+        state.resume_on(&next);
+        held.replace(std::sync::Arc::new(next))
+    };
+    list.prefixes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Prefix {
+            list: prefix,
+            predicate: None,
+        });
+    // The new segment holds recorded work of its own (the copy, behind
+    // the native commands the closed segment kept): a wait recorded next
+    // must be sampled after the queue runs it, not before it as a
+    // leading wait. `host_list` marks the segment recorded and hands it
+    // out.
+    host_list(this)
 }
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
@@ -2289,6 +2358,329 @@ mod tests {
                 slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
             }
         }
+    }
+
+    /// A dispatch of a title list writes a range of title memory, then the
+    /// list records a `CopyBufferRegion` out of that range into itself.
+    /// The copy is a CPU copy prepared when the submission starts, before
+    /// the list's dispatches have run, so recording it behind the dispatch
+    /// would read the old bytes: the recording splits at the copy (a
+    /// dependency prefix, no memory wait), and the queue runs the
+    /// dispatch's segment first, its write going back into title memory,
+    /// before the copy's segment is prepared.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_copy_of_memory_its_own_list_wrote_waits_for_the_write() {
+        if crate::host::tests::in_warp_child(
+            "list::tests::a_copy_of_memory_its_own_list_wrote_waits_for_the_write",
+        ) {
+            return;
+        }
+        own_list_copy_case(true);
+    }
+
+    /// As above, but the copy's source lies outside the written range: no
+    /// split, the whole list stays in one recording, and the copy reads
+    /// what was there when it ran.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_nonoverlapping_copy_in_its_own_list_stays_in_one_recording() {
+        if crate::host::tests::in_warp_child(
+            "list::tests::a_nonoverlapping_copy_in_its_own_list_stays_in_one_recording",
+        ) {
+            return;
+        }
+        own_list_copy_case(false);
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn own_list_copy_case(overlap: bool) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        if !crate::host::tests::on_warp(host) {
+            eprintln!("not on the software adapter; skipped");
+            return;
+        }
+        // Title memory: the buffer the dispatch writes and the copy reads,
+        // held by a buffer resource the title owns at an address.
+        let mut title = vec![0u8; 1 << 16];
+        let at = title.as_ptr() as u64;
+        let buffer = crate::resource::buffer_at(at, title.len() as u64);
+        let shadow = crate::shadow::find(at, title.len() as u64).unwrap();
+        let (root, pso) = crate::host::tests::write_pipeline(host);
+
+        // The queue, allocator and list, as the title makes them.
+        let null = std::ptr::null();
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        assert_eq!(
+            crate::queue::create_x(null, [0u32; 4].as_ptr().cast(), &PAGEABLE_IIDS[0], &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        // The dispatch of its own: the shaders write the range's host
+        // copy, and what they wrote goes back into title memory once the
+        // segment has run.
+        let segment = host_list(list).unwrap();
+        crate::host::tests::record_gpu_write(
+            &segment,
+            &shadow,
+            at,
+            (&root, &pso),
+        );
+
+        // The copy out of the written range (or out of a range beside it,
+        // filled before the dispatch), recorded as the title records one.
+        let source = if overlap {
+            0
+        } else {
+            title[8192..8192 + 256].fill(0xAA);
+            8192
+        };
+        copy_buffer_region(list, buffer, 4096, buffer, source, 256);
+
+        // The list's completion write, as the title's lists end with: it
+        // marks the end of the run for the test.
+        let done = AtomicU32::new(0);
+        host_list(list).unwrap().defer_write(
+            done.as_ptr().cast(),
+            Written::Value(1),
+            4,
+        );
+        assert_eq!(close(list), S_OK);
+        // SAFETY: the queue and the closed list are ours.
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while done.load(Ordering::Acquire) != 1 {
+            assert!(std::time::Instant::now() < deadline, "the list did not finish");
+            std::thread::yield_now();
+        }
+
+        if overlap {
+            let prefixes = prefixes(list);
+            assert_eq!(prefixes.len(), 1, "the copy split the recording");
+            assert!(prefixes[0].list.is_some(), "the split closed a segment");
+            assert!(prefixes[0].predicate.is_none(), "the split waits on no memory");
+            for (i, got) in title[4096..4096 + 256].chunks_exact(4).enumerate() {
+                assert_eq!(
+                    u32::from_le_bytes(got.try_into().unwrap()),
+                    crate::host::tests::WRITE_PATTERN + i as u32,
+                    "the copy read what the dispatch wrote"
+                );
+            }
+        } else {
+            assert!(
+                prefixes(list).is_empty(),
+                "the copy reads none of the write: one recording"
+            );
+            assert!(
+                title[4096..4096 + 256].iter().all(|&b| b == 0xAA),
+                "the copy read what was there when it ran"
+            );
+        }
+        for (i, got) in title[..256].chunks_exact(4).enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(got.try_into().unwrap()),
+                crate::host::tests::WRITE_PATTERN + i as u32,
+                "the write went back into title memory"
+            );
+        }
+
+        for object in [list, allocator, queue] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        slot::<extern "system" fn(This) -> u32>(buffer, 0x10)(buffer);
+    }
+
+    /// The title records a wait right after the copy its list makes of a
+    /// dispatch's writes, on the copied dword itself: the wait must be
+    /// sampled after the queue runs the copy's segment, not before it as
+    /// a leading wait (the copy is recorded work). The copied bytes are
+    /// the dispatch's, so the wait is satisfied and the list finishes.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_wait_behind_a_copy_of_its_own_writes_runs_after_the_copy() {
+        if crate::host::tests::in_warp_child(
+            "list::tests::a_wait_behind_a_copy_of_its_own_writes_runs_after_the_copy",
+        ) {
+            return;
+        }
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        if !crate::host::tests::on_warp(host) {
+            eprintln!("not on the software adapter; skipped");
+            return;
+        }
+        let mut title = vec![0u8; 1 << 16];
+        let at = title.as_ptr() as u64;
+        let buffer = crate::resource::buffer_at(at, title.len() as u64);
+        let shadow = crate::shadow::find(at, title.len() as u64).unwrap();
+        let (root, pso) = crate::host::tests::write_pipeline(host);
+
+        let null = std::ptr::null();
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        assert_eq!(
+            crate::queue::create_x(null, [0u32; 4].as_ptr().cast(), &PAGEABLE_IIDS[0], &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        // The dispatch of its own, then the copy out of what it wrote,
+        // into the dword the wait samples.
+        let segment = host_list(list).unwrap();
+        crate::host::tests::record_gpu_write(&segment, &shadow, at, (&root, &pso));
+        copy_buffer_region(list, buffer, 4096, buffer, 0, 256);
+
+        // The title's wait on the copied dword, then the list's
+        // completion write to mark the run's end for the test.
+        wait32(list, at + 4096, 3, crate::host::tests::WRITE_PATTERN, u32::MAX, 0);
+        let done = AtomicU32::new(0);
+        write32(list, done.as_ptr() as u64, 1, 0, 0);
+        assert_eq!(close(list), S_OK);
+        // SAFETY: the queue and the closed list are ours.
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while done.load(Ordering::Acquire) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wait never let the list finish: it was sampled before the copy ran"
+            );
+            std::thread::yield_now();
+        }
+
+        let prefixes = prefixes(list);
+        assert_eq!(prefixes.len(), 2, "the copy and the wait split the recording");
+        assert!(
+            prefixes[0].list.is_some() && prefixes[0].predicate.is_none(),
+            "the copy's split waits on no memory"
+        );
+        assert!(
+            prefixes[1].list.is_some() && prefixes[1].predicate.is_some(),
+            "the wait closes the copy's segment: it is sampled after the copy ran"
+        );
+        assert_eq!(prefixes[1].predicate.unwrap().address, (at + 4096) as usize);
+        for (i, got) in title[4096..4096 + 256].chunks_exact(4).enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(got.try_into().unwrap()),
+                crate::host::tests::WRITE_PATTERN + i as u32,
+                "the copy read what the dispatch wrote"
+            );
+        }
+        for (i, got) in title[..256].chunks_exact(4).enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(got.try_into().unwrap()),
+                crate::host::tests::WRITE_PATTERN + i as u32,
+                "the write went back into title memory"
+            );
+        }
+
+        for object in [list, allocator, queue] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        slot::<extern "system" fn(This) -> u32>(buffer, 0x10)(buffer);
+    }
+
+    /// The list records a bottom-of-pipe completion write at an address,
+    /// then a copy out of it: in title order the write lands before the
+    /// copy reads, and both are prepared before the list runs, so the
+    /// copy splits behind the write's segment and reads the written
+    /// value.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_copy_reads_a_completion_write_made_earlier_in_its_list() {
+        if crate::host::tests::in_warp_child(
+            "list::tests::a_copy_reads_a_completion_write_made_earlier_in_its_list",
+        ) {
+            return;
+        }
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        if !crate::host::tests::on_warp(host) {
+            eprintln!("not on the software adapter; skipped");
+            return;
+        }
+        let mut title = vec![0u8; 1 << 16];
+        let at = title.as_ptr() as u64;
+        let buffer = crate::resource::buffer_at(at, title.len() as u64);
+
+        let null = std::ptr::null();
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        assert_eq!(
+            crate::queue::create_x(null, [0u32; 4].as_ptr().cast(), &PAGEABLE_IIDS[0], &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        // The completion write the list records first, at the copy's
+        // source, then the copy out of it.
+        const VALUE: u64 = 0x1234_5678_9abc_def0;
+        write64(list, at + 8192, VALUE, 0, 0);
+        copy_buffer_region(list, buffer, 4096, buffer, 8192, 8);
+
+        // The list's completion write marks the run's end for the test.
+        let done = AtomicU32::new(0);
+        write32(list, done.as_ptr() as u64, 1, 0, 0);
+        assert_eq!(close(list), S_OK);
+        // SAFETY: the queue and the closed list are ours.
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while done.load(Ordering::Acquire) != 1 {
+            assert!(std::time::Instant::now() < deadline, "the list did not finish");
+            std::thread::yield_now();
+        }
+
+        let prefixes = prefixes(list);
+        assert_eq!(prefixes.len(), 1, "the copy split behind the write");
+        assert!(
+            prefixes[0].list.is_some() && prefixes[0].predicate.is_none(),
+            "the split waits on no memory"
+        );
+        assert_eq!(
+            u64::from_le_bytes(title[4096..4104].try_into().unwrap()),
+            VALUE,
+            "the copy read the completion write's value"
+        );
+
+        for object in [list, allocator, queue] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        slot::<extern "system" fn(This) -> u32>(buffer, 0x10)(buffer);
     }
 
     #[test]

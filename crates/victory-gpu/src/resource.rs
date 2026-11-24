@@ -1137,6 +1137,40 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// A title buffer over `address` (`width` bytes), as the title makes one
+/// at an address it owns (device method 0x428): for the list-order tests.
+#[cfg(test)]
+pub(crate) fn buffer_at(address: u64, width: u64) -> This {
+    let desc = ResourceDesc {
+        dimension: BUFFER,
+        alignment: 0,
+        width,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 0,
+    };
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_at_address(
+            std::ptr::null(),
+            address,
+            &desc,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        ),
+        S_OK,
+        "no buffer at the address"
+    );
+    out
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

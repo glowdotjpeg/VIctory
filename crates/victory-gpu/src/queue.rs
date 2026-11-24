@@ -144,7 +144,12 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 if !batch.is_empty() {
                     ops.push(run_lists(std::mem::take(&mut batch)));
                 }
-                ops.push(Op::Memory(crate::fence::MemoryWait::new(prefix.predicate)));
+                // A split the recording made itself (a copy of title
+                // memory behind a dispatch that wrote it) waits on
+                // nothing: the closed segment runs before the rest.
+                if let Some(predicate) = prefix.predicate {
+                    ops.push(Op::Memory(crate::fence::MemoryWait::new(predicate)));
+                }
             }
             batch.push(tail);
             if split {

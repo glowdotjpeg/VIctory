@@ -269,8 +269,10 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+// The WARP ordering tests are shared with `list.rs`'s: its helper fns
+// are pub(crate) for it.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -374,7 +376,7 @@ mod tests {
         true
     }
 
-    fn compile(source: &str, entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Vec<u8> {
+    pub(crate) fn compile(source: &str, entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Vec<u8> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
@@ -682,19 +684,103 @@ mod tests {
         assert!(!overlaps_write(&writes, 0x1080, 0), "nothing read, no split");
     }
 
+    /// The same rule for a copy recorded behind the writes in its own
+    /// recording (`copy_intersects_write`): only a shader write, a
+    /// readback or a completion write the recording already declared
+    /// splits it.
+    #[test]
+    fn only_a_copy_of_a_written_range_splits_its_recording() {
+        if host().is_none() {
+            eprintln!("no host device; skipped");
+            return;
+        }
+        let mut title = vec![0u8; 1 << 16];
+        let at = title.as_ptr() as u64;
+        let shadow = title_buffer(&mut title);
+        let written = [Step::GpuWrite(shadow.clone(), at as usize, 256)];
+        let none: [Readback; 0] = [];
+        let no_words: [(usize, crate::queue::Written, usize); 0] = [];
+        assert!(
+            copy_intersects_write(&written, &none, &no_words, at as usize + 64, 8),
+            "inside a write"
+        );
+        assert!(
+            copy_intersects_write(&written, &none, &no_words, at as usize - 8, 16),
+            "across its start"
+        );
+        assert!(
+            copy_intersects_write(&written, &none, &no_words, at as usize + 256 - 8, 16),
+            "across its end"
+        );
+        assert!(
+            !copy_intersects_write(&written, &none, &no_words, at as usize + 256, 8),
+            "touching after it"
+        );
+        assert!(
+            !copy_intersects_write(&written, &none, &no_words, at as usize + 4096, 256),
+            "beside it"
+        );
+        assert!(
+            !copy_intersects_write(&written, &none, &no_words, at as usize, 0),
+            "nothing read, no split"
+        );
+        // A readback's rows fill its destination range once the list has
+        // run, so a copy out of them splits too.
+        let filled = [Readback {
+            dst: at as usize + 8192,
+            src: 0,
+            dst_pitch: 512,
+            src_pitch: 512,
+            lines: 2,
+            row_bytes: 256,
+        }];
+        assert!(
+            copy_intersects_write(&[], &filled, &no_words, at as usize + 8192 + 512, 8),
+            "inside the rows"
+        );
+        assert!(
+            !copy_intersects_write(
+                &[],
+                &filled,
+                &no_words,
+                at as usize + 8192 + 512 + 256,
+                8
+            ),
+            "between the rows"
+        );
+        // A bottom-of-pipe completion write recorded earlier lands in
+        // title memory once the list has run; a copy out of it splits
+        // too.
+        let words = [(at as usize + 16384, crate::queue::Written::Value(7), 8)];
+        assert!(
+            copy_intersects_write(&written, &none, &words, at as usize + 16384, 8),
+            "inside the write"
+        );
+        assert!(
+            copy_intersects_write(&written, &none, &words, at as usize + 16384 - 4, 8),
+            "across its start"
+        );
+        assert!(
+            !copy_intersects_write(&written, &none, &words, at as usize + 16392, 8),
+            "touching after it"
+        );
+        crate::shadow::unregister(1, at);
+    }
+
     /// Set in the child process `in_warp_child` starts.
     const WARP_CHILD: &str = "VICTORY_TEST_WARP_CHILD";
 
-    /// Runs the test `name` alone in a child process with the host device
-    /// on the software adapter (the ordering shows on any adapter; WARP
-    /// keeps the test off hardware). One test at a time: the host device
-    /// is global and made before the first use.
-    fn in_warp_child(name: &str) -> bool {
+    /// Runs the test `test` (its full path in the test binary) alone in a
+    /// child process with the host device on the software adapter (the
+    /// ordering shows on any adapter; WARP keeps the test off hardware).
+    /// One test at a time: the host device is global and made before the
+    /// first use.
+    pub(crate) fn in_warp_child(test: &str) -> bool {
         if std::env::var_os(WARP_CHILD).is_some() {
             return false;
         }
         let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([&format!("host::tests::{name}"), "--exact", "--nocapture"])
+            .args([test, "--exact", "--nocapture"])
             .env(WARP_CHILD, "1")
             .env("VICTORY_D3D12_WARP", "1")
             .env_remove("VICTORY_D3D12_DEBUG")
@@ -718,7 +804,7 @@ mod tests {
     /// Whether the host device is on the software adapter: without it the
     /// WARP setting is ignored (diagnostics builds) and the test would run
     /// on hardware.
-    fn on_warp(host: &Host) -> bool {
+    pub(crate) fn on_warp(host: &Host) -> bool {
         // SAFETY: plain DXGI and D3D12 queries.
         unsafe {
             let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
@@ -735,7 +821,7 @@ mod tests {
     }
 
     /// What the test's dispatch writes, dword `i` of the range.
-    const WRITE_PATTERN: u32 = 0xC0DE_0000;
+    pub(crate) const WRITE_PATTERN: u32 = 0xC0DE_0000;
 
     /// A shader whose dispatch writes 64 dwords (256 bytes) at the start
     /// of the buffer it is given (as a shader's unordered access does).
@@ -749,7 +835,7 @@ mod tests {
     "#;
 
     /// The pipeline of [`WRITE_SOURCE`].
-    fn write_pipeline(host: &Host) -> (ID3D12RootSignature, ID3D12PipelineState) {
+    pub(crate) fn write_pipeline(host: &Host) -> (ID3D12RootSignature, ID3D12PipelineState) {
         use windows::core::s;
         let cs = compile(WRITE_SOURCE, s!("cs"), s!("cs_5_1"));
         // SAFETY: the shader bytes live through the call; our objects.
@@ -773,7 +859,7 @@ mod tests {
     /// Records into `a`: the refresh that gives the shaders the title's
     /// data, a dispatch whose shaders write the range, and the copy-back
     /// of what they wrote once the list has run.
-    fn record_gpu_write(
+    pub(crate) fn record_gpu_write(
         a: &HostList,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         at: u64,
@@ -796,7 +882,7 @@ mod tests {
 
     /// A title buffer for the synthetic ordering tests: the memory the
     /// test owns (`title`), with its host copy.
-    fn title_buffer(title: &mut [u8]) -> std::sync::Arc<crate::shadow::Shadow> {
+    pub(crate) fn title_buffer(title: &mut [u8]) -> std::sync::Arc<crate::shadow::Shadow> {
         let at = title.as_mut_ptr() as u64;
         crate::shadow::register(1, at, title.len() as u64);
         crate::shadow::find(at, title.len() as u64).unwrap()
@@ -811,7 +897,8 @@ mod tests {
     /// old bytes.
     #[test]
     fn a_copy_of_memory_an_earlier_list_wrote_waits_for_the_write() {
-        if in_warp_child("a_copy_of_memory_an_earlier_list_wrote_waits_for_the_write") {
+        if in_warp_child("host::tests::a_copy_of_memory_an_earlier_list_wrote_waits_for_the_write")
+        {
             return;
         }
         let Some(host) = host() else {
@@ -869,7 +956,7 @@ mod tests {
     /// submission (and the copy reads what was there when it ran).
     #[test]
     fn a_nonoverlapping_copy_stays_batched_with_the_write() {
-        if in_warp_child("a_nonoverlapping_copy_stays_batched_with_the_write") {
+        if in_warp_child("host::tests::a_nonoverlapping_copy_stays_batched_with_the_write") {
             return;
         }
         let Some(host) = host() else {
@@ -1930,6 +2017,38 @@ fn overlaps_write(writing: &[TitleRange], at: usize, len: usize) -> bool {
     writing.iter().any(|&(from, to)| from < to && at < to && from < end)
 }
 
+/// The copy-order rule within one recording: a copy of title memory
+/// splits only when its source intersects a range the recording fills
+/// after it has run — a shader write (`GpuWrite`, as title addresses), a
+/// readback, or a bottom-of-pipe completion write — all of which land in
+/// title memory only once the list has run, while the copy is prepared
+/// before it. Disjoint and merely touching ranges (one ends where the
+/// other begins) do not overlap, and an empty read reads nothing.
+fn copy_intersects_write(
+    steps: &[Step],
+    readbacks: &[Readback],
+    writes: &[(usize, crate::queue::Written, usize)],
+    at: usize,
+    len: usize,
+) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    let inside = |(from, to): (usize, usize)| from < to && at < to && from < end;
+    steps.iter().any(|step| match step {
+        Step::GpuWrite(shadow, address, written) => {
+            let (from, to) = shadow.clamped(*address, *written);
+            inside((from, to))
+        }
+        _ => false,
+    }) || readbacks.iter().map(Readback::title_range).any(inside)
+        || writes
+            .iter()
+            .map(|&(at, _, bytes)| (at, at.saturating_add(bytes)))
+            .any(inside)
+}
+
 impl HostList {
     /// Keeps `blocks` (memory handed out for the recording) until the list
     /// finishes executing and is recycled or dropped.
@@ -2233,6 +2352,23 @@ impl HostList {
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
         }
+    }
+
+    /// Whether a copy of title memory at `[src, src + len)` reads a range
+    /// an earlier step of this recording fills once the list has run: a
+    /// shader write (`GpuWrite`), a texture readback, or a bottom-of-pipe
+    /// completion write. The copy is prepared before the list runs, so
+    /// recording it here would read the old bytes; the recording splits
+    /// at the copy (see `list.rs`'s `list_for_title_copy`).
+    pub(crate) fn copy_reads_earlier_write(&self, src: *const u8, len: usize) -> bool {
+        let deferred = self.deferred();
+        copy_intersects_write(
+            &deferred.copies,
+            &deferred.readbacks,
+            &deferred.writes,
+            src as usize,
+            len,
+        )
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
