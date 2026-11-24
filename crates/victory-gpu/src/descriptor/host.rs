@@ -1023,6 +1023,74 @@ mod tests {
         assert_eq!(raw_srv_elements(4, 32, 64), None);
     }
 
+    #[test]
+    fn a_raw_srv_reads_zero_past_its_declared_extent() {
+        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+        use windows::core::s;
+
+        let Some(gpu) = host() else { return };
+        let heap = HostHeap::new(false, 0).unwrap();
+        let index = heap.dynamic(1).unwrap();
+        let (input, words) = gpu.shared_buffer(256).unwrap();
+        let (output, readback) = gpu.shared_buffer(256).unwrap();
+        let list = gpu.new_list().unwrap();
+        let source = br#"
+ByteAddressBuffer input : register(t0);
+RWByteAddressBuffer output : register(u0);
+[RootSignature("DescriptorTable(SRV(t0)), UAV(u0)")]
+[numthreads(1,1,1)]
+void main() { output.Store2(0, uint2(input.Load(0), input.Load(16))); }
+"#;
+        let mut blob: Option<ID3DBlob> = None;
+        // SAFETY: the compiled shader and its live, mapped buffers are used
+        // synchronously, and the descriptors cover their accessed words.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("root-srv-test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut blob,
+                None,
+            )
+            .unwrap();
+            let blob = blob.unwrap();
+            let code = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast(), blob.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = gpu.device.CreateRootSignature(0, code).unwrap();
+            let pso: ID3D12PipelineState = gpu.device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            words.cast::<u32>().write_volatile(0x1234);
+            words.add(16).cast::<u32>().write_volatile(0x5678);
+            heap.raw_at(index, &input, 0, 16);
+            list.buffer_state(&input, crate::host::BUFFER_READ);
+            list.buffer_state(&output, crate::host::BUFFER_WRITE);
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootDescriptorTable(0, heap.gpu_handle(index));
+            list.list.SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+            list.list.Dispatch(1, 1, 1);
+            list.close();
+            gpu.execute(&[&list], "test bounded root SRV");
+            assert_eq!(readback.cast::<[u32; 2]>().read_volatile(), [0x1234, 0]);
+        }
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {

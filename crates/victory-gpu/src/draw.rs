@@ -166,6 +166,13 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+fn root_only_view_heap() -> Option<&'static std::sync::Arc<crate::descriptor::host::HostHeap>> {
+    use crate::descriptor::host::HostHeap;
+    use std::sync::{Arc, OnceLock};
+    static HEAP: OnceLock<Option<Arc<HostHeap>>> = OnceLock::new();
+    HEAP.get_or_init(|| HostHeap::new(false, 0).map(Arc::new)).as_ref()
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -187,6 +194,7 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.fresh_tables.clear();
+        self.root_srv_slots.clear();
         if self.topology != 0 {
             self.set_topology(list, self.topology);
         }
@@ -490,22 +498,34 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let mut heaps = self.heaps.map(|h| {
+            (h != 0).then(|| crate::descriptor::heap(h as This)).and_then(|h| h.host())
+        });
+        // A root-only title pipeline has no reason to bind a view heap.
+        // Its bounded host views still need one for their descriptor tables.
+        if self.heaps[0] == 0
+            && p.stages.iter().any(|s| !s.root_srvs.is_empty())
+            && p.stages.iter().all(|s| {
+                !s.translated().used.iter().any(|r| r.root == RootType::ResourceHeap)
+            })
+        {
+            heaps[0] = root_only_view_heap();
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+        let host_heaps = heaps.map(|h| h.map_or(0, |h| h.heap.as_raw() as usize));
+        if self.host_heaps != host_heaps {
+            let native: Vec<Option<ID3D12DescriptorHeap>> = heaps
+                .into_iter()
+                .flatten()
                 .map(|h| {
                     list.keep_descriptor_heap(h);
                     Some(h.heap.clone())
                 })
                 .collect();
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            unsafe { l.SetDescriptorHeaps(&native) };
+            self.host_heaps = host_heaps;
             self.host_roots = [0; 2];
         }
         let root = p.root.as_raw() as usize;
@@ -611,11 +631,15 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_srvs {
+                let Some(heap) = heaps[0] else {
+                    once!("a root SRV without a usable view heap: the draw is dropped");
+                    return false;
+                };
                 let address = match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => None,
                 };
-                if !self.root_srv_table(list, address, param, compute) {
+                if !self.root_srv_table(list, heap, address, param, compute) {
                     return false;
                 }
             }
@@ -629,22 +653,17 @@ impl State {
     fn root_srv_table(
         &mut self,
         list: &HostList,
+        host: &std::sync::Arc<crate::descriptor::host::HostHeap>,
         address: Option<u64>,
         param: u32,
         compute: bool,
     ) -> bool {
-        let Some(host) = (self.heaps[0] != 0)
-            .then(|| crate::descriptor::heap(self.heaps[0] as This))
-            .and_then(|heap| heap.host())
-        else {
-            once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
-        };
-        let shadow = address.and_then(|address| {
-            let copy = crate::shadow::find(address, 4)?;
-            // SAFETY: a live host buffer.
-            let base = unsafe { copy.buffer.GetGPUVirtualAddress() };
-            let offset = copy.gpu(address).checked_sub(base)?;
+        let shadow = address.filter(|&address| address != 0).and_then(|address| {
+            let copy = crate::shadow::find(address, 1)?;
+            if copy.left(address) < 4 {
+                return None;
+            }
+            let offset = copy.offset(address);
             if !offset.is_multiple_of(16) {
                 once!(address = format_args!("{address:#x}"), "a misaligned root SRV reads zeros");
                 return None;
