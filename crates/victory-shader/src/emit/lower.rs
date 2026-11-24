@@ -61,14 +61,17 @@ pub(crate) struct Parts<'a> {
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
+    MeshCounts,
     Fail(ShaderError),
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut mesh_counts = true;
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, mesh_counts).run() {
             Ok(l) => return Ok(l),
+            Err(Stop::MeshCounts) => mesh_counts = false,
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -85,6 +88,199 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+
+fn is_mesh_alloc(inst: &Inst) -> bool {
+    inst.name() == "s_sendmsg"
+        && matches!(inst.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
+}
+
+struct MeshCountsPlan {
+    request: Site,
+    packed: Value,
+    join: usize,
+    dummy_exports: HashSet<Site>,
+}
+
+fn in_dom_tree(parents: &[usize], ancestor: usize, mut block: usize) -> bool {
+    while block != ancestor && block != parents[block] {
+        block = parents[block];
+    }
+    block == ancestor
+}
+
+fn mesh_counts_plan(
+    x: &Parts,
+    order: &[usize],
+    index: &[usize],
+    idom: &[usize],
+    threads: u32,
+) -> Option<MeshCountsPlan> {
+    let p = x.p;
+    let mut requests = order.iter().flat_map(|&b| {
+        p.blocks[b]
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| is_mesh_alloc(inst))
+            .map(move |(i, inst)| ((b, i), inst))
+    });
+    let (request, inst) = requests.next()?;
+    if requests.next().is_some() {
+        return None;
+    }
+    let packed = inst.read(Reg::S(crate::ir::M0))?;
+    let (request_block, _) = request;
+
+    // The iteration limit can bypass a barrier. Only select a join in an
+    // acyclic CFG, where its postdominator tree can be built in one pass.
+    let end = p.blocks.len();
+    let mut postdom = vec![end; end + 1];
+    let rank = |b| if b == end { order.len() } else { index[b] };
+    for &b in order.iter().rev() {
+        let exit = p.blocks[b].exit;
+        let successors = exit.successors();
+        if exit == Exit::Indirect || successors.iter().any(|&s| rank(s) <= rank(b)) {
+            return None;
+        }
+        postdom[b] = successors
+            .into_iter()
+            .reduce(|mut a, mut b| {
+                while a != b {
+                    if rank(a) < rank(b) {
+                        a = postdom[a];
+                    } else {
+                        b = postdom[b];
+                    }
+                }
+                a
+            })
+            .unwrap_or(end);
+    }
+    let join = postdom[request_block];
+    if join == end || !in_dom_tree(&postdom, join, order[0]) {
+        return None;
+    }
+
+    let defs: HashMap<_, _> = order
+        .iter()
+        .flat_map(|&b| {
+            p.blocks[b]
+                .insts
+                .iter()
+                .enumerate()
+                .flat_map(move |(i, inst)| {
+                    inst.writes
+                        .iter()
+                        .map(move |&(_, v)| (v, (inst, x.st.guards[b][i])))
+                })
+        })
+        .collect();
+    mesh_request_in_thread_zero(x, request_block, &defs, threads)?;
+
+    let mut dummy_exports = HashSet::new();
+    let mut has_output = false;
+    for e in &x.io.exports {
+        let (b, _) = e.site;
+        if index[b] == usize::MAX {
+            continue;
+        }
+        if in_dom_tree(idom, join, b) {
+            has_output |= e.values.iter().any(Option::is_some);
+            continue;
+        }
+        let null_position = e.target == Target::Position(0) && e.values == [None; 4];
+        let null_primitive = e.target == Target::Primitive
+            && e.values[0]
+                .and_then(|v| defs.get(&v))
+                .is_some_and(|(inst, guard)| {
+                    guard.is_none()
+                        && inst.name() == "v_bfrev_b32"
+                        && matches!(&inst.fields, Fields::Valu(v) if v.src == [Operand::Const(129)])
+                });
+        if !in_dom_tree(idom, request_block, b)
+            || (b == request_block && e.site.1 < request.1)
+            || !(null_position || null_primitive)
+        {
+            return None;
+        }
+        dummy_exports.insert(e.site);
+    }
+
+    has_output.then_some(MeshCountsPlan {
+        request,
+        packed,
+        join,
+        dummy_exports,
+    })
+}
+
+fn mesh_request_in_thread_zero(
+    x: &Parts,
+    request: usize,
+    defs: &HashMap<Value, (&Inst, Option<Bool>)>,
+    threads: u32,
+) -> Option<()> {
+    let (Atom::Lane(compare), Bool::FALSE, Bool::TRUE) = x.st.bools.node(x.st.reach[request])?
+    else {
+        return None;
+    };
+    let &(cmp, _) = defs.get(&compare)?;
+    let Fields::Valu(v) = &cmp.fields else {
+        return None;
+    };
+    let [Operand::Const(128), Operand::Vector { reg, dwords: 1 }] = v.src.as_slice() else {
+        return None;
+    };
+    if cmp.name() != "v_cmpx_eq_u32" {
+        return None;
+    }
+    let get_def = |inst: &Inst, reg| {
+        let &(inst, guard) = defs.get(&inst.read(reg)?)?;
+        guard.is_none().then_some(inst)
+    };
+    let mut lane = get_def(cmp, Reg::V(*reg))?;
+    let wave: u32 = if x.native.wave64 { 64 } else { 32 };
+    if threads > wave {
+        let Fields::Valu(v) = &lane.fields else {
+            return None;
+        };
+        let [
+            Operand::Scalar { code, dwords: 1 },
+            Operand::Const(shift),
+            Operand::Vector { reg, dwords: 1 },
+        ] = v.src.as_slice()
+        else {
+            return None;
+        };
+        if lane.name() != "v_lshl_add_u32" || u32::from(*shift) != 128 + wave.trailing_zeros() {
+            return None;
+        }
+        let base = get_def(lane, Reg::S(*code))?;
+        let info = base.read(Reg::S(3))?;
+        if base.name() != "s_bfe_u32"
+            || !matches!(&base.fields, Fields::Sop { src, .. } if src == &[Operand::Scalar { code: 3, dwords: 1 }, Operand::Literal(0x40018)])
+            || !x.io.inputs.contains(&(info, Input::MergedWaveInfo))
+        {
+            return None;
+        }
+        lane = get_def(lane, Reg::V(*reg))?;
+    }
+    if x.native.wave64 {
+        let Fields::Valu(v) = &lane.fields else {
+            return None;
+        };
+        let [Operand::Const(193), Operand::Vector { reg, dwords: 1 }] = v.src.as_slice() else {
+            return None;
+        };
+        if lane.name() != "v_mbcnt_hi_u32_b32" {
+            return None;
+        }
+        lane = get_def(lane, Reg::V(*reg))?;
+    }
+    (lane.name() == "v_mbcnt_lo_u32_b32"
+        && matches!(&lane.fields, Fields::Valu(v) if v.src == [Operand::Const(193), Operand::Const(128)]))
+        .then_some(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Numeric {
@@ -196,6 +392,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    mesh_counts_plan: Option<MeshCountsPlan>,
+    mesh_counts: Option<(V, V)>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -389,7 +587,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, plan_mesh_counts: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -461,6 +659,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut no_barrier = HashSet::new();
+        let mut mesh_counts = None;
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -482,12 +681,7 @@ impl<'a> Lower<'a> {
             }
             let idom = crate::ir::idoms(&p.blocks, &order, &index);
             let alloc: Vec<usize> = (0..p.blocks.len())
-                .filter(|&b| {
-                    p.blocks[b].insts.iter().any(|i| {
-                        i.name() == "s_sendmsg"
-                            && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
-                    })
-                })
+                .filter(|&b| p.blocks[b].insts.iter().any(is_mesh_alloc))
                 .collect();
             for &b in &order {
                 let mut d = b;
@@ -502,6 +696,12 @@ impl<'a> Lower<'a> {
                 };
                 if ms.lds_bytes == 0 || dominated {
                     no_barrier.insert(b);
+                }
+            }
+            if plan_mesh_counts && ms.lds_bytes == 0 {
+                mesh_counts = mesh_counts_plan(x, &order, &index, &idom, ms.threads);
+                if mesh_counts.is_some() {
+                    s.lds_dwords = 1;
                 }
             }
         }
@@ -544,6 +744,8 @@ impl<'a> Lower<'a> {
             console_lanes,
             flat: None,
             no_barrier,
+            mesh_counts_plan: mesh_counts,
+            mesh_counts: None,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -940,6 +1142,13 @@ impl<'a> Lower<'a> {
                     }
                 };
                 self.vals.insert(phi.value, val);
+            }
+            if self
+                .mesh_counts_plan
+                .as_ref()
+                .is_some_and(|plan| plan.join == b)
+            {
+                self.mesh_counts_begin();
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
@@ -2065,14 +2274,6 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// Mesh: the counts and the primitives no lane exports. The console's
-    /// counts come from one lane's allocation request, which DXIL cannot
-    /// express (one call, dominating every output write).
-    // shortcut: the counts are the declared maxima and the lanes first cull
-    // all primitives (all indices 0, zero area), so primitives past the
-    // program's count are culled and vertices past it unused; this costs
-    // the host the unused vertex and primitive slots. Pass the program's own
-    // counts if that shows in frame time.
     fn mesh_prologue(&mut self, mesh: super::shader::Mesh) -> Result<(), Why> {
         let threads = self.s.threads.expect("mesh")[0];
         if mesh.topology != 2 {
@@ -2084,14 +2285,71 @@ impl<'a> Lower<'a> {
         {
             return Err("a mesh shader beyond the host's limits");
         }
-        let e = self.s.entry;
-        let void = self.s.t.void;
+        if self.mesh_counts_plan.is_some() {
+            let zero = self.s.m.i32(0);
+            self.mesh_stage_counts(zero);
+            return Ok(());
+        }
         let (v, p) = (
             self.s.m.i32(mesh.max_vertices),
             self.s.m.i32(mesh.max_primitives),
         );
+        self.mesh_declare_counts(v, p);
+        Ok(())
+    }
+
+    // The same thread initializes the slot and publishes the request, so
+    // only the read at the full-group join needs a barrier.
+    fn mesh_stage_counts(&mut self, packed: V) {
+        let flat = self.mesh_thread();
+        let z = self.s.m.i32(0);
+        let first = self.s.m.cmp(self.cur, pred::EQ, flat, z);
+        let at = self.begin_guarded(Some(first));
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(self.cur, lds, z);
+        self.s.m.store(self.cur, ptr, packed);
+        self.end_guarded(at, &[]);
+    }
+
+    fn mesh_counts_begin(&mut self) {
+        let c = self.cur;
+        let mode = self.s.m.i32(1 | 8);
         self.s
-            .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+            .op(c, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
+        let lds = self.s.lds();
+        let zero = self.s.m.i32(0);
+        let ptr = self.s.m.element(c, lds, zero);
+        let packed = self.s.m.load(c, ptr);
+        let mask = self.s.m.i32(0xFFF);
+        let shift = self.s.m.i32(12);
+        let vertices = self.s.m.bin(c, Bin::And, packed, mask);
+        let primitives = self.s.m.bin(c, Bin::LShr, packed, shift);
+        let primitives = self.s.m.bin(c, Bin::And, primitives, mask);
+        let mesh = self.s.mesh.expect("mesh");
+        let max_v = self.s.m.i32(mesh.max_vertices);
+        let max_p = self.s.m.i32(mesh.max_primitives);
+        let over_v = self.s.m.cmp(c, pred::IUGT, vertices, max_v);
+        let over_p = self.s.m.cmp(c, pred::IUGT, primitives, max_p);
+        let v = self.s.m.select(c, over_v, max_v, vertices);
+        let p = self.s.m.select(c, over_p, max_p, primitives);
+        let no_vertices = self.s.m.cmp(c, pred::EQ, v, zero);
+        let p = self.s.m.select(c, no_vertices, zero, p);
+        self.mesh_counts = Some((v, p));
+        self.mesh_declare_counts(v, p);
+    }
+
+    fn mesh_declare_counts(&mut self, v: V, p: V) {
+        let mesh = self.s.mesh.expect("mesh");
+        let threads = self.s.threads.expect("mesh")[0];
+        let void = self.s.t.void;
+        self.s.op(
+            self.cur,
+            "setMeshOutputCounts",
+            Attr::NoUnwind,
+            void,
+            168,
+            &[v, p],
+        );
         let flat = self.mesh_thread();
         self.mesh_dummy_position(flat);
         let z = self.s.m.i32(0);
@@ -2102,7 +2360,7 @@ impl<'a> Lower<'a> {
                 let offset = self.s.m.i32(base);
                 self.s.m.bin(self.cur, Bin::Add, flat, offset)
             };
-            let guard = (base + threads > mesh.max_primitives)
+            let guard = (self.mesh_counts.is_some() || base + threads > mesh.max_primitives)
                 .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
             let at = self.begin_guarded(guard);
             self.s.op(
@@ -2115,7 +2373,6 @@ impl<'a> Lower<'a> {
             );
             self.end_guarded(at, &[]);
         }
-        Ok(())
     }
 
     /// The default degenerate triangles reference vertex zero. Define its
@@ -2128,6 +2385,13 @@ impl<'a> Lower<'a> {
         };
         let zero = self.s.m.i32(0);
         let first = self.s.m.cmp(self.cur, pred::EQ, thread, zero);
+        let first = match self.mesh_counts {
+            Some((vertices, _)) => {
+                let nonempty = self.s.m.cmp(self.cur, pred::NE, vertices, zero);
+                self.s.m.bin(self.cur, Bin::And, first, nonempty)
+            }
+            None => first,
+        };
         let at = self.begin_guarded(Some(first));
         let element = self.s.m.i32(position as u32);
         self.s.outputs[position].usage |= 0b1111;
@@ -2311,7 +2575,7 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.s.lds_dwords == 0 {
+        if self.s.lds_dwords == 0 || self.mesh_counts_plan.is_some() {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
@@ -2445,6 +2709,13 @@ impl<'a> Lower<'a> {
         }
         let offset = inst.machine.offset;
         let name = inst.name();
+        if let Some(plan) = &self.mesh_counts_plan
+            && plan.request == (b, i)
+        {
+            let packed = self.i32_of(plan.packed).map_err(|_| Stop::MeshCounts)?;
+            self.mesh_stage_counts(packed);
+            return Ok(());
+        }
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
@@ -6666,6 +6937,13 @@ impl<'a> Lower<'a> {
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
+        if self
+            .mesh_counts_plan
+            .as_ref()
+            .is_some_and(|plan| plan.dummy_exports.contains(&(b, i)))
+        {
+            return Ok(());
+        }
         let e = *self
             .exports
             .get(&(b, i))
@@ -6814,13 +7092,7 @@ impl<'a> Lower<'a> {
         }
         // Mesh output is indexed by thread, which can exceed the output count.
         let at = if mesh {
-            let mesh = self.s.mesh.expect("mesh");
-            let limit = if primitive {
-                mesh.max_primitives
-            } else {
-                mesh.max_vertices
-            };
-            let guard = self.mesh_output_guard(limit, guard);
+            let guard = self.mesh_output_guard(primitive, guard);
             self.begin_guarded(guard)
         } else {
             None
@@ -6881,12 +7153,22 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    fn mesh_output_guard(&mut self, limit: u32, active: Option<V>) -> Option<V> {
-        if self.s.threads.expect("mesh")[0] <= limit {
-            return active;
-        }
+    fn mesh_output_guard(&mut self, primitive: bool, active: Option<V>) -> Option<V> {
+        let limit = if let Some((v, p)) = self.mesh_counts {
+            if primitive { p } else { v }
+        } else {
+            let mesh = self.s.mesh.expect("mesh");
+            let limit = if primitive {
+                mesh.max_primitives
+            } else {
+                mesh.max_vertices
+            };
+            if self.s.threads.expect("mesh")[0] <= limit {
+                return active;
+            }
+            self.s.m.i32(limit)
+        };
         let thread = self.mesh_thread();
-        let limit = self.s.m.i32(limit);
         let in_bounds = self.s.m.cmp(self.cur, pred::IULT, thread, limit);
         Some(match active {
             Some(active) => self.s.m.bin(self.cur, Bin::And, active, in_bounds),
@@ -6900,11 +7182,13 @@ impl<'a> Lower<'a> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
         let mesh = self.s.mesh.expect("mesh");
-        let guard = self.mesh_output_guard(mesh.max_primitives, guard);
+        let guard = self.mesh_output_guard(true, guard);
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let limit = self.s.m.i32(mesh.max_vertices);
+        let limit = self
+            .mesh_counts
+            .map_or_else(|| self.s.m.i32(mesh.max_vertices), |(v, _)| v);
         let mask = self.s.m.i32(0x3ff);
         let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
         let mut indices = [z; 3];
@@ -7157,6 +7441,10 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "mesh_counts_tests.rs"]
+mod mesh_counts_tests;
 
 #[cfg(test)]
 mod tests {
