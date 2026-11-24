@@ -313,6 +313,18 @@ mod tests {
         assert!(weak_heap.upgrade().is_none());
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn dred_can_match_a_list_by_name_without_its_pointer() {
+        let Some(host) = host() else { return };
+        let a = host.new_list().unwrap();
+        let b = host.new_list().unwrap();
+        let name = windows::core::HSTRING::from(format!("{DRED_LIST_PREFIX}{}", b.dred_id));
+        let runs = [&a, &b];
+        assert_eq!(breadcrumb_list(&runs, None, PCWSTR(name.as_ptr())), Some(1));
+        assert_eq!(breadcrumb_list(&runs, Some(a.list.as_raw()), PCWSTR::null()), Some(0));
+    }
+
     #[test]
     fn buffer_states_transition_between_writes_and_reads() {
         let mut s = BufferStates::default();
@@ -681,6 +693,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    #[cfg(feature = "diagnostics")]
+    dred_id: u64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -803,6 +817,32 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     {
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+const DRED_LIST_PREFIX: &str = "VIctory command list ";
+
+fn breadcrumb_list(
+    runs: &[&HostList],
+    object: Option<*mut std::ffi::c_void>,
+    debug_name: PCWSTR,
+) -> Option<usize> {
+    let index = runs.iter().position(|r| Some(r.list.as_raw()) == object);
+    #[cfg(feature = "diagnostics")]
+    return index.or_else(|| {
+        if debug_name.is_null() {
+            return None;
+        }
+        // SAFETY: the DRED query owns its debug names while the device lives.
+        let name = unsafe { debug_name.to_string().ok()? };
+        let id: u64 = name.strip_prefix(DRED_LIST_PREFIX)?.parse().ok()?;
+        runs.iter().position(|r| r.dred_id == id)
+    });
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = debug_name;
+        index
     }
 }
 
@@ -960,6 +1000,13 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            #[cfg(feature = "diagnostics")]
+            let dred_id = {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                let id = NEXT.fetch_add(1, Ordering::Relaxed);
+                name(&list, || format!("{DRED_LIST_PREFIX}{id}"));
+                id
+            };
             Ok(HostList {
                 allocator,
                 list,
@@ -972,6 +1019,8 @@ impl Host {
                 kept_dynamic: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                dred_id,
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1283,7 +1332,7 @@ impl Host {
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
+                let index = breadcrumb_list(runs, ours, p.pCommandListDebugNameW);
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
             }
@@ -1299,7 +1348,8 @@ impl Host {
                         p.BreadcrumbCount, history[done as usize].0
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = breadcrumb_list(runs, list, p.pCommandListDebugNameW)
+                        .map(|index| runs[index]);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
