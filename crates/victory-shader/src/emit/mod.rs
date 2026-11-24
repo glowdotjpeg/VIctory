@@ -86,6 +86,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod image_atomic64_tests;
 mod lower;
 mod sampler;
 mod shader;
