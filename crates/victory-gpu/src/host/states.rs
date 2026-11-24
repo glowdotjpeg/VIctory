@@ -154,7 +154,7 @@ impl RecordedTexture {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(super) fn last(&self, subresource: u32) -> Option<u32> {
         match &self.states {
             Subresources::Uniform(state) => *state,

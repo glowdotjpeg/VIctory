@@ -2247,7 +2247,7 @@ impl HostList {
             .record(subresource, wanted, emit);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn recorded_state(&self, copy: &Arc<HostTexture>, subresource: u32) -> Option<u32> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         states

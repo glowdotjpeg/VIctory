@@ -746,12 +746,65 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
+        let mask_probe = self.mask_probe(list, p);
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
-        self.probe_dispatch_writes(list, p);
+        {
+            if let Some((id, used)) = mask_probe {
+                self.probe_masks(list, used, id, ResourceType::Uav);
+            }
+            self.probe_dispatch_writes(list, p);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn mask_probe<'a>(
+        &self,
+        list: &HostList,
+        pipeline: &'a HostPipeline,
+    ) -> Option<(u64, &'a [UsedResource])> {
+        static SHADER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        static SAMPLES: AtomicU64 = AtomicU64::new(0);
+        let selected = SHADER
+            .get_or_init(|| std::env::var("VICTORY_PROBE_MASK_SHADER").ok())
+            .as_deref()?;
+        let stage = pipeline
+            .stages
+            .iter()
+            .find(|s| s.shader.hash.eq_ignore_ascii_case(selected))?;
+        let id = SAMPLES.fetch_add(1, Ordering::Relaxed);
+        if id >= 4 {
+            return None;
+        }
+        let used = &stage.translated().used;
+        self.probe_masks(list, used, id, ResourceType::Srv);
+        tracing::info!(dispatch = id, shader = selected, "probing integer masks");
+        Some((id, used))
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn probe_masks(&self, list: &HostList, used: &[UsedResource], id: u64, kind: ResourceType) {
+        for u in used {
+            if u.kind != kind || u.root != RootType::Table {
+                continue;
+            }
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
+            let (resource, phase) = match crate::descriptor::view(handle) {
+                Some(View::Shader(resource, _)) => (resource, "input"),
+                Some(View::Unordered(resource, _, _)) => (resource, "output"),
+                _ => continue,
+            };
+            crate::capture::probe_mask(
+                list, resource as This, id, u.slot, u.table_offset_dwords, phase,
+            );
+        }
     }
 
     #[cfg(feature = "diagnostics")]

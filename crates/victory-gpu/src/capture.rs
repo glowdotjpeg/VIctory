@@ -239,6 +239,83 @@ pub(crate) fn read_back(
     }
 }
 
+/// Records a snapshot of a small integer mask at its use on the GPU.
+pub(crate) fn probe_mask(
+    list: &crate::host::HostList,
+    resource: crate::object::This,
+    dispatch: u64,
+    slot: u8,
+    table_offset: u32,
+    stage: &'static str,
+) {
+    let (Some(host), Some(copy)) = (crate::host::host(), crate::resource::host_copy(resource))
+    else {
+        return;
+    };
+    // SAFETY: the host copy is live.
+    let desc = unsafe { copy.texture.GetDesc() };
+    let texel_bytes = match desc.Format {
+        DXGI_FORMAT_R8_UINT => 1,
+        DXGI_FORMAT_R32_UINT => 4,
+        _ => return,
+    };
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.Width > 512
+        || desc.Height > 512
+        || desc.DepthOrArraySize != 1
+        || desc.MipLevels != 1
+        || desc.SampleDesc.Count != 1
+    {
+        return;
+    }
+    let Some(previous) = list.recorded_state(&copy, 0) else {
+        return;
+    };
+    crate::list::ensure_subresource_state(list, resource, 0, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+    let readback = read_back(&host.device, &list.list, &copy.texture);
+    crate::list::ensure_subresource_state(list, resource, 0, previous);
+    let Some((buffer, footprint)) = readback else {
+        return;
+    };
+    let resource = resource as usize;
+    list.defer_probe(move || {
+        let f = footprint.Footprint;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy's fence has passed and the callback owns its
+        // readback resource. The footprint gives the layout of its rows.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_err() {
+                return;
+            }
+            let bytes = std::slice::from_raw_parts(
+                data.cast::<u8>(),
+                buffer.GetDesc().Width as usize,
+            );
+            let mut nonzero = 0;
+            let mut bits = 0;
+            let mut add = |value: u32| {
+                nonzero += u32::from(value != 0);
+                bits |= value;
+            };
+            for y in 0..f.Height as usize {
+                let start = footprint.Offset as usize + y * f.RowPitch as usize;
+                let row = &bytes[start..start + f.Width as usize * texel_bytes];
+                if texel_bytes == 1 {
+                    row.iter().for_each(|&v| add(u32::from(v)));
+                } else {
+                    row.as_chunks::<4>().0.iter().for_each(|&v| add(u32::from_le_bytes(v)));
+                }
+            }
+            buffer.Unmap(0, Some(&D3D12_RANGE::default()));
+            tracing::info!(
+                dispatch, stage, slot, table_offset, resource = format_args!("{resource:#x}"),
+                width = f.Width, height = f.Height, nonzero, bits = format_args!("{bits:#x}"),
+                "sampled integer mask at dispatch"
+            );
+        }
+    });
+}
+
 /// Saves a frame read back by [`read_back`] (8-bit color only).
 pub(crate) fn save_read_back(
     frame: u64,
