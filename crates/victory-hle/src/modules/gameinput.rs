@@ -137,6 +137,17 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+fn overlay_scripted_buttons(pads: &mut [Option<PadState>; PADS], keys: &[u8]) {
+    if let Some(pad) = pads.iter_mut().flatten().next() {
+        for (key, button) in FALLBACK_BUTTONS {
+            if keys.contains(&key) {
+                pad.buttons |= button;
+            }
+        }
+    }
+}
+
 #[repr(C)]
 struct Table<const N: usize>([*const (); N]);
 // SAFETY: function addresses only.
@@ -405,6 +416,12 @@ impl Hub {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
+        };
+        #[cfg(all(windows, feature = "diagnostics"))]
+        let pads = {
+            let mut pads = pads;
+            overlay_scripted_buttons(&mut pads, &host::scripted());
+            pads
         };
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
@@ -1189,7 +1206,7 @@ mod host {
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
+    pub(super) fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
@@ -1213,7 +1230,11 @@ mod host {
                     vk,
                 ))
             });
-            (Instant::now(), keys.collect())
+            let keys: Vec<_> = keys.collect();
+            if !keys.is_empty() {
+                tracing::info!(presses = keys.len(), "scripted GameInput enabled");
+            }
+            (Instant::now(), keys)
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
@@ -1265,6 +1286,18 @@ mod tests {
     use crate::HostPolicy;
     use victory_loader::Provenance;
     use victory_pe::ImportSymbol;
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn scripted_enter_reaches_a_connected_pad() {
+        let mut pads = [None; PADS];
+        pads[0] = Some(PadState { buttons: B, left_x: 0.5, ..PadState::default() });
+        pads[1] = Some(PadState::default());
+        overlay_scripted_buttons(&mut pads, &[0x0D]);
+        assert_eq!(pads[0].unwrap().buttons, A | B);
+        assert_eq!(pads[0].unwrap().left_x, 0.5);
+        assert_eq!(pads[1].unwrap().buttons, 0);
+    }
 
     #[derive(Default)]
     struct FakeHost {
