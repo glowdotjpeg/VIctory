@@ -710,6 +710,70 @@ struct SlotWork {
     elements: Vec<Element>,
 }
 
+/// Samples the GPU's input records before the clamp can change them.
+#[cfg(feature = "diagnostics")]
+fn probe_args(
+    list: &HostList,
+    pipeline: &HostPipeline,
+    (args, at, stride, max): (&Shadow, u64, u32, u32),
+    counter: Option<(&Arc<Shadow>, u64)>,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    let frame = crate::queue::presented() + 1;
+    if !crate::capture::listed(frame) {
+        return;
+    }
+    let Some(stage) = pipeline
+        .stages
+        .iter()
+        .find(|stage| crate::pipeline::selected_for_diagnostics(&stage.shader.hash))
+    else {
+        return;
+    };
+    static SAMPLED: AtomicU32 = AtomicU32::new(0);
+    if SAMPLED.fetch_add(1, Relaxed) >= 24 {
+        return;
+    }
+    let records = u64::from(max.min(4));
+    let Some((sample, data)) = host().and_then(|h| list.readback(h, records * 16 + 4)) else {
+        return;
+    };
+    list.buffer_state(&args.buffer, crate::host::BUFFER_READ);
+    // SAFETY: the argument range holds `max` records of at least 16 bytes,
+    // and the list owns the readback buffer until its fence passes.
+    unsafe {
+        for record in 0..records {
+            list.list.CopyBufferRegion(
+                &sample,
+                record * 16,
+                &args.buffer,
+                args.offset(at) + record * u64::from(stride),
+                16,
+            );
+        }
+        if let Some((count, at)) = counter {
+            list.buffer_state(&count.buffer, crate::host::BUFFER_READ);
+            list.list.CopyBufferRegion(&sample, records * 16, &count.buffer, count.offset(at), 4);
+        }
+    }
+    let has_count = counter.is_some();
+    let data = data as usize;
+    let shader = stage.shader.hash.clone();
+    list.defer_probe(move || {
+        // SAFETY: the batch's fence is complete, and the list still owns
+        // the mapped buffer and the copied `records * 16 + count` bytes.
+        let records = unsafe {
+            std::slice::from_raw_parts(data as *const [u32; 4], records as usize)
+        };
+        let live = has_count.then(|| {
+            // SAFETY: the count copy filled the dword after the records.
+            unsafe { (data as *const u32).add(records.len() * 4).read_unaligned() }
+        });
+        tracing::info!(frame, %shader, max, ?live, ?records, "sampled indirect rectangle arguments");
+    });
+}
+
 /// Clamps the title's indirect draw arguments (`kind == 0`) and records our
 /// rectangle-expansion compute passes on `list`. On `Err(reason)` nothing was
 /// recorded onto the host list; on `Ok(prepared)` the compute pipeline and root
@@ -818,6 +882,11 @@ pub(crate) fn expand(
     }
     for w in &work {
         w.shadow.refresh(list, w.address, u64::from(w.size));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    if work.is_empty() {
+        probe_args(list, pipeline, (args, arguments, stride, max), counter);
     }
 
     // Our passes read the title's copies through unordered access. The clamp

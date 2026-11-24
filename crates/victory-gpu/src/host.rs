@@ -1199,6 +1199,8 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// Post-submission readbacks from GPU textures into title buffers.
     readbacks: Vec<Readback>,
+    #[cfg(feature = "diagnostics")]
+    probes: Vec<Box<dyn Fn() + Send + Sync>>,
     /// Host objects the list's commands name (pipelines, root signatures):
     /// the title may release its objects before it
     /// submits the list.
@@ -1648,7 +1650,12 @@ impl Host {
         // columns are written, so the rest of each row and the gaps
         // between slices keep the title's pixels.
         for &r in batch {
-            for rb in &runs[r].deferred().readbacks {
+            let deferred = runs[r].deferred();
+            #[cfg(feature = "diagnostics")]
+            for probe in &deferred.probes {
+                probe();
+            }
+            for rb in &deferred.readbacks {
                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
                     // Packed rows: one contiguous range.
                     let bytes = rb.row_bytes.saturating_mul(rb.lines);
@@ -2320,6 +2327,12 @@ impl HostList {
             lines,
             row_bytes,
         });
+    }
+
+    /// Reads a list-owned diagnostic result after the batch's fence passes.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_probe(&self, probe: impl Fn() + Send + Sync + 'static) {
+        self.deferred().probes.push(Box::new(probe));
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
