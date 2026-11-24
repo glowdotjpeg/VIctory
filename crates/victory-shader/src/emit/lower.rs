@@ -1887,6 +1887,7 @@ impl<'a> Lower<'a> {
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
         let flat = self.mesh_thread();
+        self.mesh_dummy_position(flat);
         let z = self.s.m.i32(0);
         for base in (0..mesh.max_primitives).step_by(threads as usize) {
             let index = if base == 0 {
@@ -1909,6 +1910,34 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
         }
         Ok(())
+    }
+
+    /// The default degenerate triangles reference vertex zero. Define its
+    /// position even on paths where the console exports no vertices.
+    fn mesh_dummy_position(&mut self, thread: V) {
+        let Some(position) = self.s.outputs.iter().position(|element| {
+            element.kind == 3 && element.comp == 9 && element.cols == 4 && !element.half
+        }) else {
+            return;
+        };
+        let zero = self.s.m.i32(0);
+        let first = self.s.m.cmp(self.cur, pred::EQ, thread, zero);
+        let at = self.begin_guarded(Some(first));
+        let element = self.s.m.i32(position as u32);
+        self.s.outputs[position].usage |= 0b1111;
+        for (channel, value) in [0.0f32, 0.0, 0.0, 1.0].into_iter().enumerate() {
+            let channel = self.s.m.i8(channel as u8);
+            let value = self.s.m.f32(value.to_bits());
+            self.s.op(
+                self.cur,
+                "storeVertexOutput.f32",
+                Attr::NoUnwind,
+                self.s.t.void,
+                171,
+                &[element, zero, channel, value, zero],
+            );
+        }
+        self.end_guarded(at, &[]);
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
