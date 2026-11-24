@@ -1301,7 +1301,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
+        // Skip filtered pipelines before recording the clamp.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
@@ -1315,7 +1315,18 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let len = u64::from(stride) * u64::from(max.max(1));
+        let Some(len) = crate::indirect::required_bytes(kind, stride, max) else {
+            why("unsupported signature or indirect layout");
+            return false;
+        };
+        if kind == INDEXED && self.topology == RECTANGLES {
+            once!("indirect indexed rectangles not drawn");
+            why("indexed rectangles not supported");
+            return false;
+        }
+        if max == 0 {
+            return true;
+        }
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -1330,11 +1341,6 @@ impl State {
             },
             None => None,
         };
-        if kind == INDEXED && self.topology == RECTANGLES {
-            once!("indirect indexed rectangles not drawn");
-            why("indexed rectangles not supported");
-            return false;
-        }
         if kind == DRAW && self.topology == RECTANGLES {
             let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
                 #[cfg(feature = "diagnostics")]
@@ -1348,14 +1354,10 @@ impl State {
                 ));
                 return false;
             }
-            let Some(signature) = host_signature(DRAW, 16) else {
+            let Some(signature) = host_signature(DRAW) else {
                 why("no host signature");
                 return false;
             };
-            if max == 0 {
-                DRAWN.fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
             let prepared = match crate::rectangles::expand(
                 list,
                 p,
@@ -1406,10 +1408,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let Some(signature) = host_signature(kind) else {
             why("no host signature");
             return false;
         };
@@ -1418,10 +1417,15 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        let Some(bounded) = crate::indirect::bound(
+            list,
+            (&args.buffer, args.offset(arguments)),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+            (kind, stride, max),
+        ) else {
+            why("argument clamp unavailable or source offsets unaligned");
             return false;
-        }
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -1461,13 +1465,7 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        crate::indirect::execute(
-            list,
-            &signature,
-            max,
-            (&args.buffer, args.offset(arguments)),
-            counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
-        );
+        bounded.execute(list, &signature);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1477,14 +1475,13 @@ impl State {
     }
 }
 
-/// The host command signature for one argument of `kind` with records
-/// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
+/// The cached host command signature for a packed, one-argument record.
+pub(crate) fn host_signature(kind: u32) -> Option<ID3D12CommandSignature> {
+    let stride = crate::indirect::payload_size(kind)?;
+    static MADE: std::sync::Mutex<Vec<(u32, ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == kind) {
         return Some(s.clone());
     }
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
@@ -1511,7 +1508,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         return None;
     }
     let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
+    made.push((kind, signature.clone()));
     Some(signature)
 }
 

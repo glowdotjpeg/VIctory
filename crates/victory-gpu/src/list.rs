@@ -1568,8 +1568,14 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let buffer = crate::resource::buffer_bytes(arguments);
+    let address = buffer.and_then(|(p, _)| (p as u64).checked_add(offset));
+    let counter = crate::resource::buffer_bytes(count).and_then(|(p, width)| {
+        if width.checked_sub(count_offset)? < 4 {
+            return None;
+        }
+        (p as u64).checked_add(count_offset)
+    });
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1578,9 +1584,20 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
-        });
+        let available = buffer.and_then(|(_, width)| width.checked_sub(offset));
+        if let (Some(available), Some(required)) =
+            (available, crate::indirect::required_bytes(kind, stride, max))
+            && required <= available
+        {
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            });
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!(
+                "indirect kind {kind}: unsupported layout or records outside the argument buffer"
+            ));
+        }
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(

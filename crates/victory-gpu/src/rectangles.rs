@@ -66,9 +66,6 @@ use crate::shadow::Shadow;
 /// Per-list GPU-writable vertex scratch capacity (8 MiB), reused per draw.
 pub(crate) const RECT_SCRATCH_BYTES: u64 = 8 << 20;
 
-/// Maximum records supported by one 1D `[numthreads(64, 1, 1)]` pass.
-const MAX_RECORDS: u32 = 65535 * 64;
-
 /// Maximum thread groups per dispatch dimension (D3D12 spec).
 const MAX_GROUPS_PER_DIM: u32 = 65535;
 
@@ -710,7 +707,7 @@ struct SlotWork {
     elements: Vec<Element>,
 }
 
-/// Samples the GPU's input records before the clamp can change them.
+/// Samples the original GPU input records before rectangle expansion.
 #[cfg(feature = "diagnostics")]
 fn probe_args(
     list: &HostList,
@@ -778,10 +775,9 @@ fn probe_args(
 }
 
 /// Clamps the title's indirect draw arguments (`kind == 0`) and records our
-/// rectangle-expansion compute passes on `list`. On `Err(reason)` nothing was
-/// recorded onto the host list; on `Ok(prepared)` the compute pipeline and root
-/// signature were replaced and the caller binds its graphics state, calls
-/// [`Prepared::before_draw`], executes indirect with stride 16 on
+/// rectangle-expansion compute passes on `list`. On `Ok(prepared)` the compute
+/// pipeline and root signature were replaced. The caller binds its graphics
+/// state, calls [`Prepared::before_draw`], executes indirect with stride 16 on
 /// `prepared.args_buf` without a count buffer, and calls
 /// [`Prepared::after_draw`].
 pub(crate) fn expand(
@@ -791,11 +787,10 @@ pub(crate) fn expand(
     (args, arguments, stride, max): (&Arc<Shadow>, u64, u32, u32),
     counter: Option<(&Arc<Shadow>, u64)>,
 ) -> Result<Prepared, &'static str> {
-    if stride < 16 || !stride.is_multiple_of(4) || !args.gpu(arguments).is_multiple_of(4) {
-        return Err("rectangle arguments unaligned or short");
-    }
-    if max > MAX_RECORDS {
-        return Err("too many indirect rectangle records");
+    let args_len = crate::indirect::required_bytes(0, stride, max)
+        .ok_or("unsupported rectangle argument layout")?;
+    if !args.offset(arguments).is_multiple_of(4) {
+        return Err("rectangle arguments not 4-byte aligned");
     }
     if let Some((s, at)) = counter
         && !s.gpu(at).is_multiple_of(4)
@@ -878,7 +873,6 @@ pub(crate) fn expand(
     }
 
     // Refresh title buffers at submission time.
-    let args_len = u64::from(stride) * u64::from(max.max(1));
     args.refresh(list, arguments, args_len);
     if let Some((c, at)) = counter {
         c.refresh(list, at, 4);
@@ -892,24 +886,21 @@ pub(crate) fn expand(
         probe_args(list, pipeline, (args, arguments, stride, max), counter);
     }
 
-    // Our passes read the title's copies through unordered access. The clamp
-    // transitions the arguments and we transition the count and vertices.
-    if let Some((c, _)) = counter {
-        list.buffer_state(&c.buffer, crate::host::BUFFER_WRITE);
-    }
-
-    let src_args_gpu = args.gpu(arguments);
-    if !crate::indirect::bound(list, &args.buffer, src_args_gpu, (0, stride, max)) {
-        return Err("rectangle clamp unavailable");
-    }
+    let bounded = crate::indirect::bound(
+        list,
+        (&args.buffer, args.offset(arguments)),
+        counter.map(|(c, at)| (&c.buffer, c.offset(at))),
+        (0, stride, max),
+    )
+    .ok_or("rectangle clamp unavailable")?;
+    let (src_args_gpu, count_gpu) = bounded.gpu();
 
     // SAFETY: live D3D12 resources.
     let dst_args_gpu = unsafe { dst_args_buf.GetGPUVirtualAddress() };
-    let count_gpu = counter.map_or(src_args_gpu, |(c, at)| c.gpu(at));
     let rewrite_consts = [
         max,
-        stride,
-        u32::from(counter.is_some()),
+        16,
+        u32::from(count_gpu.is_some()),
         max_src_verts,
         vert_capacity,
         u32::from(!work.is_empty()),
@@ -923,7 +914,7 @@ pub(crate) fn expand(
         l.SetPipelineState(&s.rewrite.pso);
         l.SetComputeRoot32BitConstants(0, 8, rewrite_consts.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, src_args_gpu);
-        l.SetComputeRootUnorderedAccessView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(2, count_gpu.unwrap_or(src_args_gpu));
         l.SetComputeRootUnorderedAccessView(3, alloc_gpu);
         l.SetComputeRootUnorderedAccessView(4, dst_args_gpu);
         l.Dispatch(max.div_ceil(64), 1, 1);
@@ -952,7 +943,7 @@ pub(crate) fn expand(
                 let dst_vb_gpu = dst_vb_base + layout.dst_offset;
                 let expand_consts = [
                     max,
-                    stride,
+                    16,
                     grid_x,
                     src_bias,
                     w.src_stride,
@@ -1270,17 +1261,22 @@ mod tests {
         // 5 indirect records, count buffer = 4 (record 4 must not allocate):
         // 0: 6 verts (2 rects) from 0, 1 instance
         // 1: 3 verts (1 rect) from 6, 3 instances, start_instance 7
-        // 2: out of bounds (start 8, 3 verts > 9) -> count' = 0
+        // 2: oversized record starting at 8 -> clamped, then rejected by vertex bounds
         // 3: 0 instances (3 verts, 0 instances) -> count' = 0
         // 4: past live count (3 verts, 1 instance) -> count' = 0
         let records: [[u32; 4]; 5] = [
             [6, 1, 0, 0],
             [3, 3, 6, 7],
-            [3, 1, 8, 0],
+            [u32::MAX, 1, 8, 0],
             [3, 0, 0, 0],
             [3, 1, 0, 0],
         ];
-        let (src_args_buf, src_args_ptr) = host.shared_buffer(256).expect("src_args");
+        let padded = records.map(|[a, b, c, d]| [a, b, c, d, 0xdead_beef]);
+        let words = padded.as_flattened();
+        let source_words = &words[..words.len() - 1];
+        let (src_args_buf, src_args_ptr) = host
+            .shared_buffer(size_of_val(source_words) as u64)
+            .expect("src_args");
         let (count_buf, count_ptr) = host.shared_buffer(256).expect("count");
         let (alloc_buf, alloc_ptr) = host.shared_buffer(256).expect("alloc");
         let (dst_args_buf, dst_args_ptr) = host.shared_buffer(256).expect("dst_args");
@@ -1291,9 +1287,9 @@ mod tests {
         // SAFETY: freshly mapped host buffers of sufficient size.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                records.as_ptr().cast::<u8>(),
+                source_words.as_ptr().cast::<u8>(),
                 src_args_ptr,
-                size_of_val(&records),
+                size_of_val(source_words),
             );
             (count_ptr as *mut u32).write(4);
             (alloc_ptr as *mut u32).write(0);
@@ -1305,14 +1301,26 @@ mod tests {
                 elem_ptr,
                 gpu_elems.len() * size_of::<Element>(),
             );
+        }
 
+        let bounded = crate::indirect::bound(
+            &list,
+            (&src_args_buf, 0),
+            Some((&count_buf, 0)),
+            (0, 20, records.len() as u32),
+        )
+        .unwrap();
+        let (src_args_gpu, count_gpu) = bounded.gpu();
+
+        // SAFETY: an open list and live buffers, including packed arguments.
+        unsafe {
             let rewrite_consts = [5u32, 16, 1, 9, 64, 1, 0, 0];
             let l = &list.list;
             l.SetComputeRootSignature(&s.rewrite.root);
             l.SetPipelineState(&s.rewrite.pso);
             l.SetComputeRoot32BitConstants(0, 8, rewrite_consts.as_ptr().cast(), 0);
-            l.SetComputeRootUnorderedAccessView(1, src_args_buf.GetGPUVirtualAddress());
-            l.SetComputeRootUnorderedAccessView(2, count_buf.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(1, src_args_gpu);
+            l.SetComputeRootUnorderedAccessView(2, count_gpu.unwrap());
             l.SetComputeRootUnorderedAccessView(3, alloc_buf.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(4, dst_args_buf.GetGPUVirtualAddress());
             l.Dispatch(1, 1, 1);
@@ -1333,7 +1341,7 @@ mod tests {
             l.SetPipelineState(&s.expand.pso);
             l.SetComputeRoot32BitConstants(0, 8, expand_consts.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, elem_gpu);
-            l.SetComputeRootUnorderedAccessView(2, src_args_buf.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(2, src_args_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_args_buf.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(4, src_vb_buf.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(5, dst_vb_buf.GetGPUVirtualAddress());
@@ -1344,6 +1352,11 @@ mod tests {
 
         // SAFETY: execution finished; buffers are mapped and readable.
         let (out_recs, allocated, gpu_out) = unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(src_args_ptr.cast::<u32>(), source_words.len()),
+                source_words,
+            );
+            assert_eq!(count_ptr.cast::<u32>().read(), 4);
             let mut out = [[0u32; 4]; 5];
             std::ptr::copy_nonoverlapping(
                 dst_args_ptr,

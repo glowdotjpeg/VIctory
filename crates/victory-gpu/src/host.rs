@@ -617,9 +617,9 @@ mod tests {
         };
         // As `draw.rs` executes indirect draws: clamp, bind, execute.
         let indirect = |list: &HostList| {
-            assert!(crate::indirect::bound(list, &buffer, gpu + 256, (0, 16, 1)));
+            let bounded = crate::indirect::bound(list, (&buffer, 256), None, (0, 16, 1)).unwrap();
             bind(list);
-            crate::indirect::execute(list, &signature, 1, (&buffer, 256), None);
+            bounded.execute(list, &signature);
         };
         // A list that draws, draws indirectly, draws; then one that starts
         // with an indirect draw, submitted together.
@@ -933,7 +933,7 @@ pub(crate) struct HostList {
     /// so `prelude` reconciles the states at submission. These entries
     /// also keep the textures alive until the list is reset.
     states: Mutex<States>,
-    /// The states of the host copies of title memory the list uses.
+    /// The states of title buffer copies and indirect scratch the list uses.
     buffers: Mutex<BufferStates<ID3D12Resource>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
@@ -949,6 +949,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Packed indirect arguments and count, reused in command order.
+    indirect_scratch: Mutex<Option<(ID3D12Resource, u64)>>,
     #[cfg(feature = "diagnostics")]
     dred_id: u64,
     /// GPU-writable scratch for indirect rectangle expansion (`rectangles`):
@@ -995,8 +997,8 @@ pub(crate) const BUFFER_READ: u32 = D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32;
 /// Shader writes to a host copy of title memory.
 pub(crate) const BUFFER_WRITE: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
 
-/// The states of the host copies of title memory (buffers) one list uses,
-/// by copy: the state it starts in and the one it is in now. A buffer is in
+/// The states of tracked buffers one list uses, by resource: the state it
+/// starts in and the one it is in now. A buffer is in
 /// the common state between lists: the list's prelude moves it to its first
 /// state and the list moves it back before it closes. A buffer a shader
 /// writes and a later draw reads as vertices (#199, #264) is transitioned in
@@ -1330,6 +1332,7 @@ impl Host {
                 kept_dynamic: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                indirect_scratch: Mutex::default(),
                 rect_scratch: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 dred_id,
@@ -2133,8 +2136,8 @@ impl HostList {
             .and_then(|state| state.last(subresource))
     }
 
-    /// Moves a host copy of title memory to `wanted` ([`BUFFER_READ`] or
-    /// [`BUFFER_WRITE`]) in this list: see [`BufferStates`].
+    /// Moves a tracked buffer to `wanted` ([`BUFFER_READ`] or [`BUFFER_WRITE`])
+    /// in this list and retains it. See [`BufferStates`].
     pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: u32) {
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(before) = buffers.update(buffer.as_raw() as usize, buffer.clone(), wanted) {
@@ -2426,6 +2429,22 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// Each recorded use enters `BufferStates`, which keeps earlier buffers
+    /// alive even when this slot grows or recording continues on a new segment.
+    pub(crate) fn indirect_scratch(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let mut scratch = self.indirect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, capacity)) = &*scratch
+            && *capacity >= bytes
+        {
+            return Some(buffer.clone());
+        }
+        let capacity = bytes.next_multiple_of(64 << 10);
+        let buffer = host()?.default_buffer(capacity)?;
+        name(&buffer, || format!("indirect scratch {capacity:#x}"));
+        *scratch = Some((buffer.clone(), capacity));
+        Some(buffer)
     }
 
     /// The list's GPU-writable scratch buffer for expanded indirect
