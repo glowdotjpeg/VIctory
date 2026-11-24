@@ -2653,6 +2653,12 @@ impl HostList {
         }
     }
 
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn keeps(&self, object: &impl Interface) -> bool {
+        let identity = object.cast::<windows::core::IUnknown>().unwrap();
+        self.deferred().kept.contains(&identity)
+    }
+
     pub(crate) fn keep_descriptor_heap(&self, heap: &Arc<crate::descriptor::host::HostHeap>) {
         self.deferred().descriptor_heaps.push(heap.clone());
     }

@@ -407,7 +407,10 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier, out: &mut Vec<Barrier
         if r.is_null() {
             Some(r)
         } else {
-            crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast())
+            crate::resource::host_resource(r).map(|texture| {
+                list.keep(texture);
+                texture.as_raw().cast_const().cast()
+            })
         }
     };
     match b.kind {
@@ -2022,6 +2025,44 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn barriers_retain_each_native_texture() {
+        if crate::host::tests::in_warp_child(
+            "list::tests::barriers_retain_each_native_texture",
+        ) {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !crate::host::tests::on_warp(host) {
+            return;
+        }
+        let mut bytes = vec![0u8; 3 << 16];
+        let first = bytes.as_mut_ptr() as u64;
+        let textures = [0, 1 << 16, 2 << 16]
+            .map(|offset| crate::resource::test_uav_texture(first + offset));
+        let [uav, before, after] = textures;
+        let list = host.new_list().unwrap();
+        let mut barriers = Vec::new();
+        host_barrier(
+            &list,
+            &Barrier { data: BarrierData { uav }, ..UAV_BARRIER },
+            &mut barriers,
+        );
+        host_barrier(
+            &list,
+            &Barrier { kind: 1, flags: 0, data: BarrierData { aliasing: [before, after] } },
+            &mut barriers,
+        );
+        assert_eq!(barriers.len(), 2);
+        for texture in textures {
+            assert!(list.keeps(crate::resource::host_resource(texture).unwrap()));
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(texture, 0x10)(texture), 0);
+        }
+    }
 
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]

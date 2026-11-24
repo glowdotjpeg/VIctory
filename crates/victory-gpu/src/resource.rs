@@ -1171,6 +1171,31 @@ pub(crate) fn buffer_at(address: u64, width: u64) -> This {
     out
 }
 
+#[cfg(all(test, windows, feature = "diagnostics"))]
+pub(crate) fn test_uav_texture(address: u64) -> This {
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width: 16,
+        height: 16,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 42,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 4,
+    };
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_at_address(
+            std::ptr::null(), address, &desc, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut out,
+        ),
+        S_OK
+    );
+    out
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
