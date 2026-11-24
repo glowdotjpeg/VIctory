@@ -216,6 +216,8 @@ fn wait(p: &Pending, frame: u64) {
 /// order queued. A pipeline is in at most one of the two, so a worker
 /// makes it exactly once.
 struct Queues {
+    #[cfg(feature = "diagnostics")]
+    selected: VecDeque<Arc<Pending>>,
     demand: VecDeque<Arc<Pending>>,
     spec: VecDeque<Arc<Pending>>,
 }
@@ -223,6 +225,8 @@ struct Queues {
 impl Queues {
     const fn new() -> Queues {
         Queues {
+            #[cfg(feature = "diagnostics")]
+            selected: VecDeque::new(),
             demand: VecDeque::new(),
             spec: VecDeque::new(),
         }
@@ -238,9 +242,12 @@ impl Queues {
         }
     }
 
-    /// The next pipeline to make: a waited-for one before a speculative
-    /// one.
+    /// Diagnostic dependencies, then first uses, then speculation.
     fn pop(&mut self) -> Option<Arc<Pending>> {
+        #[cfg(feature = "diagnostics")]
+        if let Some(p) = self.selected.pop_front() {
+            return Some(p);
+        }
         self.demand.pop_front().or_else(|| self.spec.pop_front())
     }
 
@@ -279,6 +286,12 @@ fn queue(p: Arc<Pending>) {
         return;
     }
     let mut held = queues.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    if p.shaders.iter().any(|s| crate::pipeline::prewarm_selected(&s.hash)) {
+        held.selected.push_back(p);
+        not_empty.notify_one();
+        return;
+    }
     held.push(p);
     not_empty.notify_one();
 }
@@ -382,6 +395,24 @@ mod tests {
         let p = pending();
         p.demanded.store(true, Ordering::Relaxed);
         p
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn explicit_dependencies_precede_other_pipeline_requests() {
+        let mut queues = Queues::new();
+        let draw = demanded();
+        let predicted = pending();
+        let depth = demanded();
+        let lighting = demanded();
+        queues.push(draw.clone());
+        queues.push(predicted.clone());
+        queues.selected.push_back(depth.clone());
+        queues.selected.push_back(lighting.clone());
+        for expected in [&depth, &lighting, &draw, &predicted] {
+            assert!(Arc::ptr_eq(&queues.pop().unwrap(), expected));
+        }
+        assert!(queues.pop().is_none());
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

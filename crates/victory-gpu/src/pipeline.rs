@@ -115,13 +115,19 @@ pub(crate) fn selected_for_diagnostics(hash: &str) -> bool {
 /// Warms shaders that a capture depends on without capturing their draws.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn prewarm_for_diagnostics(hash: &str) -> bool {
+    prewarm_selected(hash) || selected_for_diagnostics(hash)
+}
+
+/// Pipeline dependencies explicitly selected for a timed or captured run.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn prewarm_selected(hash: &str) -> bool {
     static PREWARM: OnceLock<Option<String>> = OnceLock::new();
     diagnostic_match(
         PREWARM
             .get_or_init(|| std::env::var("VICTORY_PREWARM_SHADER_MATCH").ok())
             .as_deref(),
         hash,
-    ) || selected_for_diagnostics(hash)
+    )
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]

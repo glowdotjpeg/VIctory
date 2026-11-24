@@ -254,10 +254,13 @@ pub(crate) fn probe_mask(
     };
     // SAFETY: the host copy is live.
     let desc = unsafe { copy.texture.GetDesc() };
-    let (texel_bytes, max_width, max_height) = match desc.Format {
-        DXGI_FORMAT_R8_UINT => (1, 512, 512),
-        DXGI_FORMAT_R32_UINT => (4, 512, 512),
-        DXGI_FORMAT_R32_FLOAT => (4, 2560, 1440),
+    let (texel_bytes, max_width, max_height, floating) = match desc.Format {
+        DXGI_FORMAT_R8_UINT => (1, 512, 512, false),
+        DXGI_FORMAT_R32_UINT => (4, 512, 512, false),
+        // Subresource zero of a D32S8 texture is its four-byte depth plane.
+        DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
+            (4, 2560, 1440, true)
+        }
         _ => return,
     };
     if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
@@ -279,7 +282,6 @@ pub(crate) fn probe_mask(
         return;
     };
     let resource = resource as usize;
-    let floating = desc.Format == DXGI_FORMAT_R32_FLOAT;
     list.defer_probe(move || {
         let f = footprint.Footprint;
         let mut data = std::ptr::null_mut();
