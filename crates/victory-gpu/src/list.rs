@@ -2408,7 +2408,10 @@ mod tests {
         // Title memory: the buffer the dispatch writes and the copy reads,
         // held by a buffer resource the title owns at an address.
         let mut title = vec![0u8; 1 << 16];
-        let at = title.as_ptr() as u64;
+        if !overlap {
+            title[8192..8192 + 256].fill(0xAA);
+        }
+        let at = title.as_mut_ptr() as u64;
         let buffer = crate::resource::buffer_at(at, title.len() as u64);
         let shadow = crate::shadow::find(at, title.len() as u64).unwrap();
         let (root, pso) = crate::host::tests::write_pipeline(host);
@@ -2442,12 +2445,7 @@ mod tests {
 
         // The copy out of the written range (or out of a range beside it,
         // filled before the dispatch), recorded as the title records one.
-        let source = if overlap {
-            0
-        } else {
-            title[8192..8192 + 256].fill(0xAA);
-            8192
-        };
+        let source = if overlap { 0 } else { 8192 };
         copy_buffer_region(list, buffer, 4096, buffer, source, 256);
 
         // The list's completion write, as the title's lists end with: it
@@ -2473,9 +2471,9 @@ mod tests {
             assert_eq!(prefixes.len(), 1, "the copy split the recording");
             assert!(prefixes[0].list.is_some(), "the split closed a segment");
             assert!(prefixes[0].predicate.is_none(), "the split waits on no memory");
-            for (i, got) in title[4096..4096 + 256].chunks_exact(4).enumerate() {
+            for (i, &got) in title[4096..4096 + 256].as_chunks::<4>().0.iter().enumerate() {
                 assert_eq!(
-                    u32::from_le_bytes(got.try_into().unwrap()),
+                    u32::from_le_bytes(got),
                     crate::host::tests::WRITE_PATTERN + i as u32,
                     "the copy read what the dispatch wrote"
                 );
@@ -2490,9 +2488,9 @@ mod tests {
                 "the copy read what was there when it ran"
             );
         }
-        for (i, got) in title[..256].chunks_exact(4).enumerate() {
+        for (i, &got) in title[..256].as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
-                u32::from_le_bytes(got.try_into().unwrap()),
+                u32::from_le_bytes(got),
                 crate::host::tests::WRITE_PATTERN + i as u32,
                 "the write went back into title memory"
             );
@@ -2528,7 +2526,7 @@ mod tests {
             return;
         }
         let mut title = vec![0u8; 1 << 16];
-        let at = title.as_ptr() as u64;
+        let at = title.as_mut_ptr() as u64;
         let buffer = crate::resource::buffer_at(at, title.len() as u64);
         let shadow = crate::shadow::find(at, title.len() as u64).unwrap();
         let (root, pso) = crate::host::tests::write_pipeline(host);
@@ -2583,16 +2581,16 @@ mod tests {
             "the wait closes the copy's segment: it is sampled after the copy ran"
         );
         assert_eq!(prefixes[1].predicate.unwrap().address, (at + 4096) as usize);
-        for (i, got) in title[4096..4096 + 256].chunks_exact(4).enumerate() {
+        for (i, &got) in title[4096..4096 + 256].as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
-                u32::from_le_bytes(got.try_into().unwrap()),
+                u32::from_le_bytes(got),
                 crate::host::tests::WRITE_PATTERN + i as u32,
                 "the copy read what the dispatch wrote"
             );
         }
-        for (i, got) in title[..256].chunks_exact(4).enumerate() {
+        for (i, &got) in title[..256].as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
-                u32::from_le_bytes(got.try_into().unwrap()),
+                u32::from_le_bytes(got),
                 crate::host::tests::WRITE_PATTERN + i as u32,
                 "the write went back into title memory"
             );
@@ -2628,7 +2626,7 @@ mod tests {
             return;
         }
         let mut title = vec![0u8; 1 << 16];
-        let at = title.as_ptr() as u64;
+        let at = title.as_mut_ptr() as u64;
         let buffer = crate::resource::buffer_at(at, title.len() as u64);
 
         let null = std::ptr::null();
