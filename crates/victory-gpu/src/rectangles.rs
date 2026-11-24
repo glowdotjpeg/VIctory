@@ -2,7 +2,7 @@
 //! topology 17, `ExecuteIndirect` kind 0). Direct rectangle draws expand
 //! their vertices on the CPU ([`crate::primitive::expand_rects`]); indirect
 //! draws only know their vertex counts on the GPU, so after
-//! [`crate::indirect::clamp_uav`] bounds each record, two compute passes of
+//! [`crate::indirect::bound`] bounds each record, two compute passes of
 //! ours run before `ExecuteIndirect`:
 //!
 //! 1. `rect_rewrite` reads each live record (skipping records at or past the
@@ -820,17 +820,14 @@ pub(crate) fn expand(
         w.shadow.refresh(list, w.address, u64::from(w.size));
     }
 
-    // Our passes read the title's copies through unordered access: the clamp
-    // writes the arguments, the title's compute may have written the count and
-    // the vertices. The list's buffer states carry them there; the list-owned
-    // scratch needs no state of theirs.
-    list.buffer_state(&args.buffer, crate::host::BUFFER_WRITE);
+    // Our passes read the title's copies through unordered access. The clamp
+    // transitions the arguments and we transition the count and vertices.
     if let Some((c, _)) = counter {
         list.buffer_state(&c.buffer, crate::host::BUFFER_WRITE);
     }
 
     let src_args_gpu = args.gpu(arguments);
-    if !crate::indirect::clamp_uav(list, src_args_gpu, (0, stride, max)) {
+    if !crate::indirect::bound(list, &args.buffer, src_args_gpu, (0, stride, max)) {
         return Err("rectangle clamp unavailable");
     }
 
