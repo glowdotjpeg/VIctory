@@ -18,6 +18,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 mod states;
+#[cfg(all(test, feature = "diagnostics"))]
+mod depth_uav_tests;
 #[cfg(feature = "diagnostics")]
 mod removal_trace;
 pub(crate) use states::HostTexture;
