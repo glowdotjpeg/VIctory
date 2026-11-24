@@ -145,6 +145,127 @@ fn lds_reduction(x: &Parts) -> Option<[usize; 2]> {
     (waited(restore, first) && waited(last, narrow)).then_some([first, last])
 }
 
+/// A single-wave reduction that accumulates an OR mask and counters in
+/// LDS after lane-local control flow. The native waits order the guarded
+/// clears and the final reads against the whole wave's atomic updates.
+fn lds_counted_reduction(x: &Parts) -> Option<[Site; 2]> {
+    let entry = &x.p.blocks[0];
+    let is_lds = |inst: &Inst| {
+        matches!(inst.fields, Fields::Ds { .. } | Fields::Buffer { lds: true, .. })
+            || inst.name() == "s_barrier"
+    };
+    let mut entry_lds = entry.insts.iter().enumerate().filter(|(_, i)| is_lds(i));
+    let ((first, a), (last, b)) = (entry_lds.next()?, entry_lds.next()?);
+    let init_mask = x.st.guards[0][first]?;
+    if a.name() != "ds_write2_b32"
+        || b.name() != "ds_write2_b32"
+        || x.st.guards[0][last] != Some(init_mask)
+        || entry_lds.next().is_some()
+    {
+        return None;
+    }
+    let restore = (last + 1..entry.insts.len()).find(|&i| writes_exec(&entry.insts[i]))?;
+    if entry.insts[restore].name() != "s_mov_b64" {
+        return None;
+    }
+    let init_wait = entry.lgkm_waits.iter().copied().find(|&i| {
+        restore < i && i < entry.insts.len()
+            && !entry.insts[restore + 1..i].iter().any(writes_exec)
+    })?;
+    for (b, block) in x.p.blocks.iter().enumerate().skip(1) {
+        if x.st.reach[b] != Bool::TRUE {
+            continue;
+        }
+        let atomics: Vec<_> = block.insts.iter().enumerate().filter(|(_, i)| is_lds(i)).collect();
+        let [(_, or), (_, add1), (_, add2), (last, or2)] = atomics.as_slice() else {
+            continue;
+        };
+        if [or.name(), add1.name(), add2.name(), or2.name()]
+            != ["ds_or_b32", "ds_add_u32", "ds_add_u32", "ds_or_b32"]
+        {
+            continue;
+        }
+        let Some(restore) = (*last + 1..block.insts.len()).find(|&i| writes_exec(&block.insts[i])) else {
+            continue;
+        };
+        let Some(narrow) = (restore + 1..block.insts.len()).find(|&i| writes_exec(&block.insts[i])) else {
+            continue;
+        };
+        if block.insts[restore].name() != "s_mov_b64"
+            || block.insts[narrow].name() != "s_and_saveexec_b64"
+            || block.insts.last()?.name() != "s_cbranch_execz"
+        {
+            continue;
+        }
+        let Exit::Branch { not_taken, .. } = block.exit else {
+            continue;
+        };
+        let reader = &x.p.blocks[not_taken];
+        if reader.preds != [b]
+            || x.st.reach[not_taken] != init_mask
+            || reader.insts.iter().find(|i| is_lds(i)).map(Inst::name) != Some("ds_read2_b32")
+        {
+            continue;
+        }
+        let Some(wait) = block.lgkm_waits.iter().copied().find(|&i| restore < i && i <= narrow) else {
+            continue;
+        };
+        if reached_once_by_all_lanes(x.st, b) {
+            return Some([(0, init_wait), (b, wait)]);
+        }
+    }
+    None
+}
+
+fn writes_exec(inst: &Inst) -> bool {
+    inst.write(Reg::S(EXEC)).is_some() || inst.write(Reg::S(EXEC + 1)).is_some()
+}
+
+/// All lowered paths from entry must reach the barrier before ending or
+/// entering a loop. A path after the barrier must never return to it.
+fn reached_once_by_all_lanes(st: &Structured, join: usize) -> bool {
+    fn successors(exit: LaneExit) -> [Option<usize>; 2] {
+        match exit {
+            LaneExit::Jump(to) => [Some(to), None],
+            LaneExit::Branch { taken, not_taken, .. } => [Some(taken), Some(not_taken)],
+            LaneExit::End | LaneExit::Indirect => [None, None],
+        }
+    }
+    let mut reaches = vec![false; st.exits.len()];
+    reaches[join] = true;
+    loop {
+        let mut changed = false;
+        for (b, &exit) in st.exits.iter().enumerate() {
+            if reaches[b] {
+                continue;
+            }
+            let [first, second] = successors(exit);
+            if first.is_some_and(|to| reaches[to]) && second.is_none_or(|to| reaches[to]) {
+                reaches[b] = true;
+                changed = true;
+            }
+        }
+        if !changed || reaches[0] {
+            break;
+        }
+    }
+    if !reaches[0] {
+        return false;
+    }
+    let mut seen = vec![false; st.exits.len()];
+    let mut pending: Vec<_> = successors(st.exits[join]).into_iter().flatten().collect();
+    while let Some(b) = pending.pop() {
+        if b == join {
+            return false;
+        }
+        if std::mem::replace(&mut seen[b], true) {
+            continue;
+        }
+        pending.extend(successors(st.exits[b]).into_iter().flatten());
+    }
+    true
+}
+
 struct MeshCountsPlan {
     request: Site,
     packed: Value,
@@ -436,6 +557,7 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// Entry-block LDS reduction with native completion waits.
     lds_reduction: Option<[usize; 2]>,
+    counted_reduction: Option<[Site; 2]>,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -710,6 +832,7 @@ impl<'a> Lower<'a> {
         });
         let mut console_lanes = false;
         let mut reduction = None;
+        let mut counted_reduction = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -764,6 +887,9 @@ impl<'a> Lower<'a> {
             }
             if one_wave && s.lds_dwords > 0 {
                 reduction = lds_reduction(x);
+                if reduction.is_none() {
+                    counted_reduction = lds_counted_reduction(x);
+                }
             }
         }
         let mut no_barrier = HashSet::new();
@@ -849,6 +975,7 @@ impl<'a> Lower<'a> {
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             lds_reduction: reduction,
+            counted_reduction,
             src0: None,
             console_lanes,
             flat: None,
@@ -1261,6 +1388,9 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                if self.counted_reduction.is_some_and(|sites| sites.contains(&(b, i))) {
+                    self.group_barrier(false);
+                }
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
