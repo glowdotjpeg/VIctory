@@ -278,6 +278,21 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    fn a_recorded_list_keeps_the_descriptor_heap_owner_until_reset() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let heap = Arc::new(crate::descriptor::host::HostHeap::new(false, 1).unwrap());
+        let weak_heap = Arc::downgrade(&heap);
+        list.keep_descriptor_heap(&heap);
+        drop(heap);
+        assert!(weak_heap.upgrade().is_some());
+
+        list.close();
+        list.reset();
+        assert!(weak_heap.upgrade().is_none());
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -394,10 +409,12 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
-    /// Host objects the list's commands name (pipelines, root signatures,
-    /// descriptor heaps): the title may release its objects before it
+    /// Host objects the list's commands name (pipelines, root signatures):
+    /// the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Retain each bound heap and the resources its slots own.
+    descriptor_heaps: Vec<Arc<crate::descriptor::host::HostHeap>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1215,6 +1232,10 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn keep_descriptor_heap(&self, heap: &Arc<crate::descriptor::host::HostHeap>) {
+        self.deferred().descriptor_heaps.push(heap.clone());
     }
 
     /// Whether this is the first time since the reset that the list asks

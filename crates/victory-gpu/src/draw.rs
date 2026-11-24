@@ -74,15 +74,15 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
+    /// The dynamic slots the list holds: host heap, first, count; given
     /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    dynamic: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, u32, u32)>,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, first, n) in &self.dynamic {
+            heap.release(*first, *n);
         }
     }
 }
@@ -415,9 +415,11 @@ impl State {
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .map(|h| {
+                    list.keep_descriptor_heap(h);
+                    Some(h.heap.clone())
+                })
                 .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
@@ -464,8 +466,42 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        None if u.root == RootType::Table => {
+                            let Some((table, heap)) = self.bound_table(compute, u.slot) else {
+                                once!(slot = u.slot, "draw or dispatch dropped: descriptor table not bound");
+                                return false;
+                            };
+                            let Some(host) = heap.host() else {
+                                once!(slot = u.slot, "draw or dispatch dropped: descriptor heap unavailable");
+                                return false;
+                            };
+                            let Some(index) = heap.index(table).filter(|&i| i < host.count()) else {
+                                once!(slot = u.slot, "draw or dispatch dropped: descriptor table outside host heap");
+                                return false;
+                            };
+                            index * if heap.samplers() { 16 } else { 32 }
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                }
+                #[cfg(feature = "diagnostics")]
+                if crate::pipeline::selected_for_diagnostics(&stage.shader.hash) {
+                    static LOGGED: AtomicU64 = AtomicU64::new(0);
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
+                        let slot_zero = (self.heaps[0] != 0)
+                            .then(|| crate::descriptor::heap(self.heaps[0] as This))
+                            .and_then(|heap| heap.host())
+                            .and_then(|heap| heap.describe_slot(0));
+                        tracing::info!(
+                            shader = %stage.shader.hash,
+                            list = ?l.as_raw(),
+                            ?slot_zero,
+                            user_data = ?t.host.user_data,
+                            ?values,
+                            resources = ?t.used,
+                            "selected shader bindings"
+                        );
+                    }
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -603,6 +639,17 @@ impl State {
         }
     }
 
+    fn bound_table(&self, compute: bool, slot: u8) -> Option<(u64, &'static crate::descriptor::Heap)> {
+        let &Root::Table(table) = self.roots_ref(compute).get(usize::from(slot))? else {
+            return None;
+        };
+        let heap = self.heap_of(table)?;
+        let stride = if heap.samplers() { 16 } else { 32 };
+        (table - heap.start)
+            .is_multiple_of(stride)
+            .then_some((table, heap))
+    }
+
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
@@ -647,20 +694,17 @@ impl State {
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
+            let (table, heap) = self.bound_table(compute, u.slot)?;
+            if heap.samplers() != (u.kind == ResourceType::Sampler) {
+                return None;
             }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-                continue;
-            };
             let end = table.checked_add(u64::from(u.table_offset_dwords) * 4)?;
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
-                continue;
-            };
+            let host = heap.host()?;
+            let index = heap.index(end)?;
             if index >= host.count() {
+                if heap.samplers() {
+                    return None;
+                }
                 fresh.push(u.slot);
             }
         }
@@ -673,20 +717,13 @@ impl State {
         }
         let mut made = Vec::new();
         for slot in fresh {
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-                continue;
-            };
+            let (table, heap) = self.bound_table(compute, slot)?;
             let entries: Vec<&UsedResource> = used
                 .iter()
                 .filter(tables)
                 .filter(|u| u.slot == slot)
                 .collect();
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            let Some(host) = heap.host() else {
-                continue;
-            };
+            let host = heap.host()?;
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
@@ -717,8 +754,7 @@ impl State {
             }
             let first = host.dynamic(n)?;
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push((host.clone(), first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1204,7 +1240,17 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expanded_vertices, rect_source};
+    use super::{State, expanded_vertices, rect_source};
+
+    #[test]
+    fn a_table_requires_a_bound_heap() {
+        let mut state = State::default();
+        assert!(state.bound_table(false, 0).is_none());
+        state.set_table(false, 0, 0);
+        assert!(state.bound_table(false, 0).is_none());
+        state.set_table(false, 0, 0x1000);
+        assert!(state.bound_table(false, 0).is_none());
+    }
 
     #[test]
     fn rectangle_vertices_inside_their_buffer() {

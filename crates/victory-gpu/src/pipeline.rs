@@ -100,6 +100,15 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn selected_for_diagnostics(hash: &str) -> bool {
+    static SELECTED: OnceLock<Option<String>> = OnceLock::new();
+    SELECTED
+        .get_or_init(|| std::env::var("VICTORY_DUMP_SHADER_MATCH").ok())
+        .as_deref()
+        .is_some_and(|selected| selected.eq_ignore_ascii_case(hash))
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
@@ -123,18 +132,20 @@ impl Shader {
                             error = %e,
                             "shader does not translate; its pipelines' draws are dropped"
                         );
-                        #[cfg(feature = "diagnostics")]
-                        self.dump_failed();
                     }
+                }
+                #[cfg(feature = "diagnostics")]
+                if done.is_err() || selected_for_diagnostics(&self.hash) {
+                    self.dump_shader();
                 }
                 done.ok()
             })
             .as_ref()
     }
 
-    /// Keeps failed inputs for offline translation checks on this machine.
+    /// Keeps inputs for offline translation checks on this machine.
     #[cfg(feature = "diagnostics")]
-    fn dump_failed(&self) {
+    fn dump_shader(&self) {
         use std::io::{ErrorKind, Write};
         use std::path::PathBuf;
 
@@ -144,7 +155,7 @@ impl Shader {
             match std::fs::create_dir_all(&dir) {
                 Ok(()) => Some(dir),
                 Err(error) => {
-                    tracing::warn!(?dir, %error, "failed shader dump directory is unavailable");
+                    tracing::warn!(?dir, %error, "shader dump directory is unavailable");
                     None
                 }
             }
@@ -156,7 +167,7 @@ impl Shader {
         if let Err(error) = saved
             && error.kind() != ErrorKind::AlreadyExists
         {
-            tracing::warn!(?path, %error, "could not save failed shader");
+            tracing::warn!(?path, %error, "could not save shader input");
         }
     }
 }
