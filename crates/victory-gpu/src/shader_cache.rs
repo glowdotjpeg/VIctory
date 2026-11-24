@@ -1,13 +1,18 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content and by the identity of
+//! the build that translated it — the `victory-shader` translator's
+//! compile-time fingerprint (its sources, manifest, dependency lockfile,
+//! target, features and toolchain), the loop limit (which a diagnostics
+//! build can change at run time) and the cache entry format — so a
+//! changed translator never serves an old translation, while a rebuild
+//! that does not touch the translation (tracing, the host queue, any
+//! other part of VIctory) keeps every entry. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! must be added to `encode` and `decode` too, and `SERIALIZER_VERSION`
+//! bumped — the translator fingerprint does not cover this file.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -36,13 +41,13 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
+/// What identifies this build's translations: a fingerprint of everything
+/// that can change them, hashed by [`build_key`] from the `victory-shader`
+/// translator's compile-time fingerprint and the loop limit (which a
 /// diagnostics build can change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -50,22 +55,28 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
+        build_key(victory_shader::TRANSLATOR_FINGERPRINT, limit)
     })
 }
+
+/// The cache-key prefix a translation is stored under: the translator
+/// fingerprint and the loop limit, plus the entry format. Pure, for
+/// testing: two checkouts of the same translator, run with the same
+/// settings, produce the same key; a changed translator, loop limit or
+/// entry format produces a different one and misses.
+fn build_key(fingerprint: &str, limit: u32) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(fingerprint.as_bytes());
+    h.update(&[0]);
+    h.update(&limit.to_le_bytes());
+    h.update(&SERIALIZER_VERSION.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// The format of the cache entries `encode` writes and `decode` reads.
+/// Bumped whenever either changes what bytes it produces or accepts;
+/// entries of the old format then miss.
+const SERIALIZER_VERSION: u32 = 1;
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
@@ -89,8 +100,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        // The entry format; the translator fingerprint in the input does
+        // the rest of the versioning.
+        SERIALIZER_VERSION
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -322,6 +334,11 @@ mod tests {
         assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
+        // Back on the first build, its serialized entry is reused exactly
+        // as it was: another translator's translations did not evict it.
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
@@ -334,6 +351,28 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn the_build_key_covers_every_translation_input() {
+        let base = build_key("a translator fingerprint", 4096);
+        // Same inputs, same key: what two checkouts build must agree on.
+        assert_eq!(base, build_key("a translator fingerprint", 4096));
+        // A changed translator fingerprint misses instead of serving the
+        // old translation, and so does a changed loop limit.
+        assert_ne!(base, build_key("another translator fingerprint", 4096));
+        assert_ne!(base, build_key("a translator fingerprint", 1024));
+    }
+
+    #[test]
+    fn build_keys_on_the_translator_and_the_loop_limit() {
+        assert_eq!(
+            *build(),
+            build_key(
+                victory_shader::TRANSLATOR_FINGERPRINT,
+                victory_shader::emit::loop_limit()
+            )
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

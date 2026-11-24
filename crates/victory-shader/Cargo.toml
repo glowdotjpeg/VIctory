@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+build = "build.rs"
 
 [dependencies]
 thiserror.workspace = true
@@ -35,6 +36,10 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
 ] }
+
+[build-dependencies]
+# Only to hash the fingerprint's inputs in build.rs.
+blake3.workspace = true
 
 [lints]
 workspace = true

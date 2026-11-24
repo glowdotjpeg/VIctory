@@ -23,6 +23,16 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
 
+/// A compile-time fingerprint of everything that can change what
+/// [`emit::translate`] produces: the sources of this crate, its manifest
+/// and the workspace's dependency lockfile, the target, the enabled
+/// features and the toolchain (the crate's `build.rs`).
+///
+/// `victory-gpu`'s shader cache keys every translation on it, so a
+/// rebuilt translator misses instead of serving an old translation, while
+/// changes elsewhere in VIctory leave every translation in place.
+pub const TRANSLATOR_FINGERPRINT: &str = env!("VICTORY_SHADER_FINGERPRINT");
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]
