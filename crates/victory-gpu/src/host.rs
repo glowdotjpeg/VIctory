@@ -2252,6 +2252,11 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
+            // The window may belong to a title thread. Let that thread maximize
+            // it without waiting here or resizing the presentation buffers.
+            if !IsZoomed(hwnd).as_bool() {
+                let _ = ShowWindowAsync(hwnd, SW_MAXIMIZE);
+            }
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
                 swap_chain,
